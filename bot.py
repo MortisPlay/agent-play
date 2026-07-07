@@ -369,17 +369,54 @@ def is_ai_quote_message(message: Message | None) -> bool:
     return False
 
 
-def ensure_quote_stats_entry(text: str) -> dict[str, Any]:
+def ensure_quote_stats_entry(
+    text: str,
+    source_chat_id: int | None = None,
+    source_message_id: int | None = None,
+) -> dict[str, Any]:
     quote_key = get_quote_key(text)
     entry = quote_stats.get(quote_key)
     if not entry:
-        entry = {"text": text, "likes": 0, "dislikes": 0, "voters": {}}
+        entry = {
+            "text": text,
+            "likes": 0,
+            "dislikes": 0,
+            "voters": {},
+        }
+        if source_chat_id is not None and source_message_id is not None:
+            entry["source_chat_id"] = int(source_chat_id)
+            entry["source_message_id"] = int(source_message_id)
         quote_stats[quote_key] = entry
     else:
         voters = entry.get("voters")
         if not isinstance(voters, dict):
             entry["voters"] = {}
+        if (
+            source_chat_id is not None
+            and source_message_id is not None
+            and entry.get("source_chat_id") is None
+            and entry.get("source_message_id") is None
+        ):
+            entry["source_chat_id"] = int(source_chat_id)
+            entry["source_message_id"] = int(source_message_id)
     return entry
+
+
+def format_quote_source(entry: dict[str, Any]) -> str:
+    source_chat_id = entry.get("source_chat_id")
+    source_message_id = entry.get("source_message_id")
+    if source_chat_id is None or source_message_id is None:
+        return "Источник неизвестен"
+
+    try:
+        chat_id = int(source_chat_id)
+    except (TypeError, ValueError):
+        return "Источник неизвестен"
+
+    if chat_id < 0:
+        return f"https://t.me/c/{abs(chat_id)}/{source_message_id}"
+
+    return f"Личное сообщение#{source_message_id}"
 
 
 def build_feedback_markup(text: str) -> InlineKeyboardMarkup:
@@ -551,8 +588,14 @@ def create_sticker_bytes(text: str) -> bytes:
     return output.getvalue()
 
 
-async def send_quote_with_feedback(chat_id: int, reply_to_message_id: int | None, reply_text: str) -> None:
-    ensure_quote_stats_entry(reply_text)
+async def send_quote_with_feedback(
+    chat_id: int,
+    reply_to_message_id: int | None,
+    reply_text: str,
+    source_chat_id: int | None = None,
+    source_message_id: int | None = None,
+) -> None:
+    ensure_quote_stats_entry(reply_text, source_chat_id=source_chat_id, source_message_id=source_message_id)
     display_text = build_quote_display_text(reply_text)
     markup = build_feedback_markup(reply_text)
     if reply_to_message_id:
@@ -656,15 +699,28 @@ async def handle_quote_command(message: Message):
     resolved_style = get_quote_style(explicit_style) if explicit_style else infer_quote_style(merged_text, text)
     await bot.send_chat_action(chat_id=message.chat.id, action="typing")
     reply_text = await generate_quote_reply(merged_text, resolved_style, text)
-    ensure_quote_stats_entry(reply_text)
-    await send_quote_with_feedback(message.chat.id, message.message_id, reply_text)
+    await send_quote_with_feedback(
+        message.chat.id,
+        message.message_id,
+        reply_text,
+        source_chat_id=replied.chat.id,
+        source_message_id=replied.message_id,
+    )
 
 
 @dp.message(Command(commands=["topquotes", "top"], ignore_case=True))
 async def handle_top_quotes(message: Message):
+    rated_quotes = [
+        item
+        for item in quote_stats.values()
+        if int(item.get("likes", 0)) > 0 or int(item.get("dislikes", 0)) > 0
+    ]
     ranked = sorted(
-        quote_stats.values(),
-        key=lambda item: (int(item.get("likes", 0)), -int(item.get("dislikes", 0))),
+        rated_quotes,
+        key=lambda item: (
+            int(item.get("likes", 0)) - int(item.get("dislikes", 0)),
+            int(item.get("likes", 0)),
+        ),
         reverse=True,
     )[:5]
 
@@ -672,11 +728,17 @@ async def handle_top_quotes(message: Message):
         await message.reply("Пока никто не оценивал цитаты. Лайкай и собирай топ!")
         return
 
-    lines = [
-        f"{idx + 1}. <b>{html.escape(str(item.get('text', '—')))}</b> — 👍 {item.get('likes', 0)}"
-        for idx, item in enumerate(ranked)
-    ]
-    await message.reply("Топ 5 залайканных цитат:\n" + "\n".join(lines), parse_mode="HTML")
+    lines = []
+    for idx, item in enumerate(ranked):
+        text = html.escape(str(item.get("text", "—")))
+        likes = int(item.get("likes", 0))
+        dislikes = int(item.get("dislikes", 0))
+        source = html.escape(format_quote_source(item))
+        lines.append(
+            f"{idx + 1}. <b>{text}</b> — 👍 {likes} 👎 {dislikes}\nИсточник: {source}"
+        )
+
+    await message.reply("Топ 5 оценённых цитат:\n" + "\n\n".join(lines), parse_mode="HTML")
 
 
 @dp.message(Command(commands=["sticker", "savequote", "qs"], ignore_case=True))
@@ -748,9 +810,14 @@ async def handle_general_templates(message: Message):
 
     if is_video_update_request(text):
         answers = [
-            "Бро, время летит как со скоростью ходьбы, следи за анонсом)",
-            "Мортис многое мог обещать но доказать ему не дали - следи за анонсом на нашем канале)",
-            "Я уже красный, культурно не получится!!! Не задавай глупые вопросы и жди - там всё распишут на нашем канале.",
+            "Бро, новое видео уже в работе. Следи за анонсом на канале, не пропустишь 🔥",
+            "Когда будет — тогда и будет. Анонс обязательно появится у нас в канале)",
+            "Терпение, брат. Всё выйдет, когда будет готово. Следи за анонсами)",
+            "Я бы сказал точную дату, но тогда Mortis меня прибьёт 😂 Жди анонс на канале",
+            "Скоро, уже пахнет новым видосом. Анонс будет — не прогляди!",
+            "Новое видео в процессе. Чтобы не ждать в пустоту — подписан на канал? Там всё будет)",
+            "Бро, не дави, дай нам пожарить контент как следует. Анонс на канале будет первым делом",
+            "Когда рак на горе свистнет... или когда анонс выйдет — как повезёт 😏 Следи за каналом",
         ]
         await message.reply(random.choice(answers))
         return
@@ -759,8 +826,13 @@ async def handle_general_templates(message: Message):
         try:
             await bot.send_chat_action(chat_id=message.chat.id, action="typing")
             reply_text = await generate_quote_reply(text, None, text)
-            ensure_quote_stats_entry(reply_text)
-            await send_quote_with_feedback(message.chat.id, None, reply_text)
+            await send_quote_with_feedback(
+                message.chat.id,
+                None,
+                reply_text,
+                source_chat_id=message.chat.id,
+                source_message_id=message.message_id,
+            )
         except Exception as e:
             print(f"Ошибка периодического reply: {e}")
             traceback.print_exc()
