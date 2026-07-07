@@ -7,6 +7,7 @@ import json
 import os
 import random
 import re
+import sqlite3
 import time
 import traceback
 from pathlib import Path
@@ -27,9 +28,24 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 FONT_PATH = os.getenv("FONT_PATH", "Roboto-Bold.ttf")
 BOT_USERNAME: str | None = None
-DATA_DIR = Path(__file__).resolve().parent
+
+
+def resolve_data_dir() -> Path:
+    configured = os.getenv("DATA_DIR") or os.getenv("PERSISTENT_DIR") or os.getenv("STORAGE_DIR")
+    if configured:
+        path = Path(configured).expanduser()
+    elif os.name != "nt":
+        path = Path("/data")
+    else:
+        path = Path(__file__).resolve().parent / "data"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+DATA_DIR = resolve_data_dir()
 STATS_PATH = DATA_DIR / "quote_stats.json"
 CHAT_SETTINGS_PATH = DATA_DIR / "chat_settings.json"
+DB_PATH = DATA_DIR / "bot_data.sqlite3"
 ADMIN_IDS = {int(item) for item in os.getenv("ADMIN_IDS", "").split(",") if item.strip().isdigit()}
 AUTO_QUOTE_ENABLED = True
 AI_RESPONSE_ENABLED = True
@@ -37,6 +53,22 @@ chat_settings: dict[str, dict[str, Any]] = {}
 pending_suggestions: dict[int, int] = {}
 pending_admin_comments: dict[int, str] = {}
 suggestion_anonymity: dict[int, bool] = {}
+
+WELCOME_TEXT = (
+    "Привет! Я — бот-агент. Упомяни меня в сообщении и задай вопрос,\n"
+    "например: @agentplay_bot Как мне сделать X?\n\n"
+    "Если хочешь внести идею или предложку — нажми кнопку ниже.\n"
+    "А ещё у нас есть крутое приложение с видео и обновлениями"
+)
+
+HELP_TEXT = (
+    "Как пользоваться ботом:\n\n"
+    "• Упомяни меня в чате и задай вопрос — я отвечу как агент.\n"
+    "• Ответь на сообщение командой /q — я сделаю из него цитату.\n"
+    "• Используй /top, чтобы посмотреть самые оценённые цитаты.\n"
+    "• Отправь /sticker в ответ на AI-цитату, чтобы сохранить её как стикер.\n"
+    "• Нажми кнопку ниже, если хочешь отправить предложку."
+)
 
 # Инициализация бота и клиента ИИ
 bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
@@ -110,26 +142,6 @@ def is_admin_user(user: Any | None) -> bool:
     if not ADMIN_IDS:
         return True
     return int(getattr(user, "id", 0)) in ADMIN_IDS
-
-
-def load_chat_settings() -> dict[str, dict[str, Any]]:
-    global chat_settings
-    if CHAT_SETTINGS_PATH.exists():
-        try:
-            with CHAT_SETTINGS_PATH.open("r", encoding="utf-8") as handle:
-                data = json.load(handle)
-            if isinstance(data, dict):
-                chat_settings = data
-        except Exception:
-            chat_settings = {}
-    else:
-        chat_settings = {}
-    return chat_settings
-
-
-def save_chat_settings() -> None:
-    with CHAT_SETTINGS_PATH.open("w", encoding="utf-8") as handle:
-        json.dump(chat_settings, handle, ensure_ascii=False, indent=2)
 
 
 def get_chat_setting(chat_id: int | None, key: str, default: Any = True) -> Any:
@@ -252,14 +264,34 @@ async def send_suggestion_to_admin(message: Message, chat_id: int, suggestion_id
         traceback.print_exc()
 
 
+def init_storage_db() -> None:
+    with sqlite3.connect(DB_PATH) as connection:
+        connection.execute("CREATE TABLE IF NOT EXISTS quote_stats (key TEXT PRIMARY KEY, payload TEXT NOT NULL)")
+        connection.execute("CREATE TABLE IF NOT EXISTS chat_settings (chat_id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
+        connection.commit()
+
+
 def load_quote_stats() -> dict[str, dict[str, Any]]:
     global quote_stats
+    init_storage_db()
+
+    try:
+        with sqlite3.connect(DB_PATH) as connection:
+            rows = connection.execute("SELECT key, payload FROM quote_stats").fetchall()
+            if rows:
+                quote_stats = {key: json.loads(payload) for key, payload in rows if isinstance(payload, str)}
+                return quote_stats
+    except Exception:
+        quote_stats = {}
+
     if STATS_PATH.exists():
         try:
             with STATS_PATH.open("r", encoding="utf-8") as handle:
                 data = json.load(handle)
             if isinstance(data, dict):
                 quote_stats = data
+                save_quote_stats()
+                return quote_stats
         except Exception:
             quote_stats = {}
     else:
@@ -268,8 +300,55 @@ def load_quote_stats() -> dict[str, dict[str, Any]]:
 
 
 def save_quote_stats() -> None:
-    with STATS_PATH.open("w", encoding="utf-8") as handle:
-        json.dump(quote_stats, handle, ensure_ascii=False, indent=2)
+    init_storage_db()
+    with sqlite3.connect(DB_PATH) as connection:
+        connection.execute("DELETE FROM quote_stats")
+        for key, entry in quote_stats.items():
+            connection.execute(
+                "INSERT INTO quote_stats (key, payload) VALUES (?, ?)",
+                (key, json.dumps(entry, ensure_ascii=False)),
+            )
+        connection.commit()
+
+
+def load_chat_settings() -> dict[str, dict[str, Any]]:
+    global chat_settings
+    init_storage_db()
+
+    try:
+        with sqlite3.connect(DB_PATH) as connection:
+            rows = connection.execute("SELECT chat_id, payload FROM chat_settings").fetchall()
+            if rows:
+                chat_settings = {chat_id: json.loads(payload) for chat_id, payload in rows if isinstance(payload, str)}
+                return chat_settings
+    except Exception:
+        chat_settings = {}
+
+    if CHAT_SETTINGS_PATH.exists():
+        try:
+            with CHAT_SETTINGS_PATH.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            if isinstance(data, dict):
+                chat_settings = data
+                save_chat_settings()
+                return chat_settings
+        except Exception:
+            chat_settings = {}
+    else:
+        chat_settings = {}
+    return chat_settings
+
+
+def save_chat_settings() -> None:
+    init_storage_db()
+    with sqlite3.connect(DB_PATH) as connection:
+        connection.execute("DELETE FROM chat_settings")
+        for chat_id, entry in chat_settings.items():
+            connection.execute(
+                "INSERT INTO chat_settings (chat_id, payload) VALUES (?, ?)",
+                (chat_id, json.dumps(entry, ensure_ascii=False)),
+            )
+        connection.commit()
 
 
 load_quote_stats()
@@ -1073,17 +1152,16 @@ async def handle_admin_panel(message: Message):
     await message.reply("Админ-панель", reply_markup=build_admin_markup(message.chat.id))
 
 
-@dp.message(Command(commands=["start", "help"], ignore_case=True))
-async def handle_start_help(message: Message):
+@dp.message(Command(commands=["start"], ignore_case=True))
+async def handle_start(message: Message):
     if not get_chat_setting(message.chat.id, 'welcome_enabled', True):
         return
-    await message.answer(
-        "Привет! Я — бот-агент. Упомяни меня в сообщении и задай вопрос,\n"
-        "например: @bot_username Как мне сделать X?\n\n"
-        "Если хочешь внести идею или предложку — нажми кнопку ниже.\n"
-        "А ещё у нас есть крутое приложение с видео и обновлениями ✨",
-        reply_markup=build_welcome_markup(message.chat.id),
-    )
+    await message.answer(WELCOME_TEXT, reply_markup=build_welcome_markup(message.chat.id))
+
+
+@dp.message(Command(commands=["help"], ignore_case=True))
+async def handle_help(message: Message):
+    await message.answer(HELP_TEXT, reply_markup=build_welcome_markup(message.chat.id))
 
 
 @dp.message(Command(commands=["q"], ignore_case=True))
