@@ -7,12 +7,14 @@ import json
 import os
 import random
 import re
+import time
 import traceback
 from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher
+from aiogram.dispatcher.middlewares.base import BaseMiddleware
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo
 from aiogram.types.input_file import BufferedInputFile
@@ -27,10 +29,57 @@ FONT_PATH = os.getenv("FONT_PATH", "Roboto-Bold.ttf")
 BOT_USERNAME: str | None = None
 DATA_DIR = Path(__file__).resolve().parent
 STATS_PATH = DATA_DIR / "quote_stats.json"
+ADMIN_IDS = {int(item) for item in os.getenv("ADMIN_IDS", "").split(",") if item.strip().isdigit()}
+AUTO_QUOTE_ENABLED = True
+AI_RESPONSE_ENABLED = True
 
 # Инициализация бота и клиента ИИ
 bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
 dp = Dispatcher()
+
+
+class AntiFloodMiddleware(BaseMiddleware):
+    def __init__(self, limit_seconds: float = 3.0) -> None:
+        super().__init__()
+        self.limit_seconds = limit_seconds
+        self.last_user_action: dict[int, float] = {}
+
+    async def __call__(self, handler, event, data):
+        if not hasattr(event, "from_user") or not getattr(event, "from_user", None):
+            return await handler(event, data)
+
+        user = event.from_user
+        if getattr(user, "is_bot", False):
+            return await handler(event, data)
+
+        user_id = getattr(user, "id", None)
+        if user_id is None:
+            return await handler(event, data)
+
+        text = (getattr(event, "text", None) or getattr(event, "caption", "") or "").strip()
+        mention_bot = False
+        if BOT_USERNAME:
+            mention_bot = f"@{BOT_USERNAME.lower()}" in text.lower()
+        else:
+            mention_bot = "@" in text and any(part.startswith("@") for part in text.split())
+        is_targeted = text.startswith("/q") or mention_bot
+        if not is_targeted:
+            return await handler(event, data)
+
+        now = time.monotonic()
+        last_time = self.last_user_action.get(user_id)
+        if last_time is not None and now - last_time < self.limit_seconds:
+            try:
+                await event.answer("Слишком часто, подожди немного перед следующим запросом.⏳")
+            except Exception:
+                pass
+            return
+
+        self.last_user_action[user_id] = now
+        return await handler(event, data)
+
+
+dp.message.outer_middleware(AntiFloodMiddleware())
 
 # Подключаем AsyncOpenAI к серверу OpenRouter
 ai_client = AsyncOpenAI(
@@ -41,11 +90,40 @@ ai_client = AsyncOpenAI(
 quote_stats: dict[str, dict[str, Any]] = {}
 
 try:
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw, ImageFont, ImageOps
 except Exception:  # pragma: no cover - optional dependency for stickers
     Image = None
     ImageDraw = None
     ImageFont = None
+    ImageOps = None
+
+
+def is_admin_user(user: Any | None) -> bool:
+    if not user:
+        return False
+    if not ADMIN_IDS:
+        return True
+    return int(getattr(user, "id", 0)) in ADMIN_IDS
+
+
+def build_admin_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"🧠 AI: {'вкл' if AI_RESPONSE_ENABLED else 'выкл'}",
+                    callback_data="admin_toggle_ai",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"💬 Автоцитаты: {'вкл' if AUTO_QUOTE_ENABLED else 'выкл'}",
+                    callback_data="admin_toggle_quotes",
+                )
+            ],
+            [InlineKeyboardButton(text="📊 Статус", callback_data="admin_status")],
+        ]
+    )
 
 
 def load_quote_stats() -> dict[str, dict[str, Any]]:
@@ -373,6 +451,8 @@ def ensure_quote_stats_entry(
     text: str,
     source_chat_id: int | None = None,
     source_message_id: int | None = None,
+    source_user_id: int | None = None,
+    source_username: str | None = None,
 ) -> dict[str, Any]:
     quote_key = get_quote_key(text)
     entry = quote_stats.get(quote_key)
@@ -386,6 +466,10 @@ def ensure_quote_stats_entry(
         if source_chat_id is not None and source_message_id is not None:
             entry["source_chat_id"] = int(source_chat_id)
             entry["source_message_id"] = int(source_message_id)
+        if source_user_id is not None:
+            entry["source_user_id"] = int(source_user_id)
+        if source_username:
+            entry["source_username"] = str(source_username)
         quote_stats[quote_key] = entry
     else:
         voters = entry.get("voters")
@@ -399,6 +483,10 @@ def ensure_quote_stats_entry(
         ):
             entry["source_chat_id"] = int(source_chat_id)
             entry["source_message_id"] = int(source_message_id)
+        if source_user_id is not None and entry.get("source_user_id") is None:
+            entry["source_user_id"] = int(source_user_id)
+        if source_username and not entry.get("source_username"):
+            entry["source_username"] = str(source_username)
     return entry
 
 
@@ -534,13 +622,34 @@ async def extract_text_source(message: Message) -> str:
     return ""
 
 
-def create_sticker_bytes(text: str) -> bytes:
+async def get_user_avatar_bytes(user_id: int | None) -> bytes | None:
+    if not user_id or not bot:
+        return None
+    try:
+        photos = await bot.get_user_profile_photos(user_id)
+        if not getattr(photos, "photos", None) or not photos.photos:
+            return None
+        file_id = photos.photos[0][0].file_id
+        file = await bot.get_file(file_id)
+        buffer = io.BytesIO()
+        await bot.download_file(file.file_path, buffer)
+        return buffer.getvalue()
+    except Exception as exc:
+        print(f"Ошибка загрузки аватара: {exc}")
+        return None
+
+
+async def create_sticker_bytes(text: str, user_photo: bytes | None = None, username: str | None = None) -> bytes:
     if Image is None or ImageDraw is None or ImageFont is None:
         raise RuntimeError("Pillow не установлен")
 
     width, height = 512, 512
-    image = Image.new("RGBA", (width, height), (18, 18, 18, 255))
+    image = Image.new("RGBA", (width, height), (16, 20, 30, 255))
     draw = ImageDraw.Draw(image)
+
+    draw.rounded_rectangle((20, 20, width - 20, height - 20), radius=36, fill=(24, 28, 42, 255), outline=(87, 102, 129, 255), width=3)
+    draw.rounded_rectangle((34, 34, width - 34, height - 34), radius=28, fill=(12, 16, 25, 255))
+    draw.rectangle((36, 34, width - 36, 70), fill=(255, 107, 107, 255))
 
     font_path = None
     if os.path.exists(FONT_PATH):
@@ -548,22 +657,54 @@ def create_sticker_bytes(text: str) -> bytes:
     elif os.path.exists(str(DATA_DIR / FONT_PATH)):
         font_path = str(DATA_DIR / FONT_PATH)
 
-    font = None
+    font_title = None
+    font_body = None
     if font_path:
         try:
-            font = ImageFont.truetype(font_path, 34)
+            font_title = ImageFont.truetype(font_path, 28)
+            font_body = ImageFont.truetype(font_path, 30)
         except Exception:
-            font = ImageFont.load_default()
-    if font is None:
-        font = ImageFont.load_default()
+            font_title = ImageFont.load_default()
+            font_body = ImageFont.load_default()
+    if font_title is None:
+        font_title = ImageFont.load_default()
+    if font_body is None:
+        font_body = ImageFont.load_default()
 
-    max_width = width - 80
-    words = text.split()
+    if user_photo:
+        try:
+            avatar = Image.open(io.BytesIO(user_photo)).convert("RGBA").resize((96, 96))
+            mask = Image.new("L", avatar.size, 0)
+            avatar_draw = ImageDraw.Draw(mask)
+            avatar_draw.ellipse((0, 0, avatar.size[0] - 1, avatar.size[1] - 1), fill=255)
+            avatar.putalpha(mask)
+            image.alpha_composite(avatar, dest=(44, 86))
+            draw.ellipse((44, 86, 44 + 96, 86 + 96), outline=(255, 255, 255, 255), width=3)
+        except Exception:
+            pass
+
+    label = "QuotLy"
+    draw.text((150, 62), label, fill=(255, 255, 255, 255), font=font_title)
+
+    display_name = (username or "anonymous").strip()
+    if display_name and not display_name.startswith("@"):
+        display_name = f"@{display_name}"
+    if not display_name:
+        display_name = "@anonymous"
+    display_name = display_name[:22]
+    draw.text((150, 96), display_name, fill=(188, 213, 255, 255), font=font_title)
+
+    quote_text = re.sub(r"\s+", " ", text).strip() or ""
+    if not quote_text:
+        quote_text = "Ничего не вижу, только тишина..."
+
+    max_width = width - 120
+    words = quote_text.split()
     lines: list[str] = []
     current_line = ""
     for word in words:
         test_line = f"{current_line} {word}".strip()
-        bbox = draw.textbbox((0, 0), test_line, font=font)
+        bbox = draw.textbbox((0, 0), test_line, font=font_body)
         if bbox[2] <= max_width or not current_line:
             current_line = test_line
         else:
@@ -571,17 +712,14 @@ def create_sticker_bytes(text: str) -> bytes:
             current_line = word
     if current_line:
         lines.append(current_line)
-
     if not lines:
-        lines = [text[:40]]
+        lines = [quote_text[:40]]
 
-    line_height = 48
-    text_height = len(lines) * line_height
-    start_y = max(40, (height - text_height) // 2)
-
-    for index, line in enumerate(lines):
+    start_y = 152
+    line_height = 42
+    for index, line in enumerate(lines[:5]):
         y = start_y + index * line_height
-        draw.text((40, y), line, fill=(255, 255, 255, 255), font=font)
+        draw.text((44, y), line, fill=(255, 255, 255, 255), font=font_body)
 
     output = io.BytesIO()
     image.save(output, format="WEBP")
@@ -594,14 +732,52 @@ async def send_quote_with_feedback(
     reply_text: str,
     source_chat_id: int | None = None,
     source_message_id: int | None = None,
+    source_user_id: int | None = None,
+    source_username: str | None = None,
 ) -> None:
-    ensure_quote_stats_entry(reply_text, source_chat_id=source_chat_id, source_message_id=source_message_id)
+    ensure_quote_stats_entry(
+        reply_text,
+        source_chat_id=source_chat_id,
+        source_message_id=source_message_id,
+        source_user_id=source_user_id,
+        source_username=source_username,
+    )
     display_text = build_quote_display_text(reply_text)
     markup = build_feedback_markup(reply_text)
     if reply_to_message_id:
         await bot.send_message(chat_id=chat_id, text=display_text, reply_to_message_id=reply_to_message_id, reply_markup=markup)
     else:
         await bot.send_message(chat_id=chat_id, text=display_text, reply_markup=markup)
+
+
+@dp.callback_query(lambda callback: callback.data and callback.data.startswith("admin_"))
+async def handle_admin_callbacks(callback: CallbackQuery):
+    if not is_admin_user(callback.from_user):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+
+    global AUTO_QUOTE_ENABLED, AI_RESPONSE_ENABLED
+    data = callback.data or ""
+
+    if data == "admin_toggle_ai":
+        AI_RESPONSE_ENABLED = not AI_RESPONSE_ENABLED
+        await callback.answer(f"ИИ-ответы {'включены' if AI_RESPONSE_ENABLED else 'выключены'}")
+    elif data == "admin_toggle_quotes":
+        AUTO_QUOTE_ENABLED = not AUTO_QUOTE_ENABLED
+        await callback.answer(f"Автоцитаты {'включены' if AUTO_QUOTE_ENABLED else 'выключены'}")
+    else:
+        await callback.answer("Статус обновлён")
+
+    if callback.message:
+        try:
+            await callback.message.edit_text(
+                "Админ-панель\n\n"
+                f"• AI ответы: {'вкл' if AI_RESPONSE_ENABLED else 'выкл'}\n"
+                f"• Автоцитаты: {'вкл' if AUTO_QUOTE_ENABLED else 'выкл'}",
+                reply_markup=build_admin_markup(),
+            )
+        except Exception:
+            pass
 
 
 @dp.callback_query(lambda callback: callback.data and callback.data.startswith("quote_"))
@@ -648,6 +824,14 @@ async def handle_quote_feedback(callback: CallbackQuery):
             reply_markup=build_feedback_markup(str(entry.get("text", ""))),
         )
     await callback.answer("Оценка сохранена")
+
+
+@dp.message(Command(commands=["admin"], ignore_case=True))
+async def handle_admin_panel(message: Message):
+    if not is_admin_user(message.from_user):
+        await message.reply("Нет доступа.")
+        return
+    await message.reply("Админ-панель", reply_markup=build_admin_markup())
 
 
 @dp.message(Command(commands=["start", "help"], ignore_case=True))
@@ -705,6 +889,8 @@ async def handle_quote_command(message: Message):
         reply_text,
         source_chat_id=replied.chat.id,
         source_message_id=replied.message_id,
+        source_user_id=getattr(replied.from_user, "id", None),
+        source_username=getattr(replied.from_user, "username", None) or getattr(replied.from_user, "first_name", None),
     )
 
 
@@ -741,7 +927,12 @@ async def handle_top_quotes(message: Message):
     await message.reply("Топ 5 оценённых цитат:\n" + "\n\n".join(lines), parse_mode="HTML")
 
 
-@dp.message(Command(commands=["sticker", "savequote", "qs"], ignore_case=True))
+@dp.message(Command(commands=["qs"], ignore_case=True))
+async def handle_qs_removed(message: Message):
+    await message.reply("Команда /qs временно отключена. Используйте /sticker или /savequote.")
+
+
+@dp.message(Command(commands=["sticker", "savequote"], ignore_case=True))
 async def handle_save_quote_sticker(message: Message):
     if not message.reply_to_message:
         await message.reply("Стикер можно сохранить только для AI-цитаты. Ответьте на сообщение с цитатой бота.")
@@ -757,8 +948,18 @@ async def handle_save_quote_sticker(message: Message):
         await message.reply("Не удалось извлечь текст AI-цитаты из ответа.")
         return
 
+    quote_key = get_quote_key(text)
+    quote_entry = quote_stats.get(quote_key) or ensure_quote_stats_entry(text)
+    source_user_id = quote_entry.get("source_user_id")
+    source_username = quote_entry.get("source_username")
+
     try:
-        sticker_bytes = create_sticker_bytes(text)
+        avatar_bytes = await get_user_avatar_bytes(int(source_user_id) if source_user_id is not None else None)
+        sticker_bytes = await create_sticker_bytes(
+            text,
+            user_photo=avatar_bytes,
+            username=source_username,
+        )
         await bot.send_sticker(chat_id=message.chat.id, sticker=BufferedInputFile(sticker_bytes, filename="quote.webp"))
     except Exception as exc:
         print(f"Ошибка создания стикера: {exc}")
@@ -785,7 +986,7 @@ async def handle_general_templates(message: Message):
         except Exception:
             BOT_USERNAME = None
 
-    if BOT_USERNAME and f"@{BOT_USERNAME.lower()}" in text.lower():
+    if AI_RESPONSE_ENABLED and BOT_USERNAME and f"@{BOT_USERNAME.lower()}" in text.lower():
         clean_text = re.sub(rf"@{re.escape(BOT_USERNAME)}", "", text, flags=re.I).strip()
         if not clean_text:
             await message.reply("Да? Чем помочь? Напишите вопрос после упоминания бота.")
@@ -822,7 +1023,7 @@ async def handle_general_templates(message: Message):
         await message.reply(random.choice(answers))
         return
 
-    if random.random() < 0.08:
+    if AUTO_QUOTE_ENABLED and random.random() < 0.08:
         try:
             await bot.send_chat_action(chat_id=message.chat.id, action="typing")
             reply_text = await generate_quote_reply(text, None, text)
@@ -832,6 +1033,8 @@ async def handle_general_templates(message: Message):
                 reply_text,
                 source_chat_id=message.chat.id,
                 source_message_id=message.message_id,
+                source_user_id=getattr(message.from_user, "id", None),
+                source_username=getattr(message.from_user, "username", None) or getattr(message.from_user, "first_name", None),
             )
         except Exception as e:
             print(f"Ошибка периодического reply: {e}")
