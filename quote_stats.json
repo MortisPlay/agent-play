@@ -6,5 +6,76 @@
     "voters": {
       "335236137": "like"
     }
+  },
+  "06146dc05fc99101": {
+    "text": "Вправду, что-то так и норовишь немного высказаться, бро 😂",
+    "likes": 0,
+    "dislikes": 1,
+    "voters": {
+      "5888932828": "dislike"
+    },
+    "source_chat_id": -1001976822115,
+    "source_message_id": 14920,
+    "source_user_id": 335236137,
+    "source_username": "MortisPlay32"
+  },
+  "92bb1fb100af6bba": {
+    "text": "Мне не нравится твое отношение 😂",
+    "likes": 1,
+    "dislikes": 0,
+    "voters": {
+      "5888932828": "like"
+    },
+    "source_chat_id": -1001976822115,
+    "source_message_id": 14939,
+    "source_user_id": 5888932828,
+    "source_username": "Enotik_cryt"
+  },
+  "31204f4b87f89ba1": {
+    "text": "Нет, я не сучка, а человек с работой и перспективой 😂",
+    "likes": 2,
+    "dislikes": 0,
+    "voters": {
+      "5888932828": "like",
+      "335236137": "like"
+    },
+    "source_chat_id": -1001976822115,
+    "source_message_id": 14931,
+    "source_user_id": 5888932828,
+    "source_username": "Enotik_cryt"
+  },
+  "0f31d7abda3aa03c": {
+    "text": "Ай-яй-яй, похоже, у тебя проблемы с грамматикой и математикой одновременно 🔥",
+    "likes": 1,
+    "dislikes": 0,
+    "voters": {
+      "5888932828": "like"
+    },
+    "source_chat_id": -1001976822115,
+    "source_message_id": 14920,
+    "source_user_id": 335236137,
+    "source_username": "MortisPlay32"
+  },
+  "77a19d7a9bc87ccd": {
+    "text": "Чувак, какое новое угощение? Известная фраза в известном поисковике 😬",
+    "likes": 0,
+    "dislikes": 0,
+    "voters": {},
+    "source_chat_id": -1001976822115,
+    "source_message_id": 14954,
+    "source_user_id": 5888932828,
+    "source_username": "Enotik_cryt"
+  },
+  "7fa782804a137fe1": {
+    "text": "Блохота-то обычно и на стороне своей сучьей кошки 🫠",
+    "likes": 1,
+    "dislikes": 0,
+    "voters": {
+      "335236137": "like"
+    },
+    "source_chat_id": -1001976822115,
+    "source_message_id": 14958,
+    "source_user_id": 335236137,
+    "source_username": "MortisPlay32"
   }
 }
