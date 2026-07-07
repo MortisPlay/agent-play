@@ -580,6 +580,7 @@ def ensure_quote_stats_entry(
     source_message_id: int | None = None,
     source_user_id: int | None = None,
     source_username: str | None = None,
+    source_chat_username: str | None = None,
 ) -> dict[str, Any]:
     quote_key = get_quote_key(text)
     entry = quote_stats.get(quote_key)
@@ -597,6 +598,8 @@ def ensure_quote_stats_entry(
             entry["source_user_id"] = int(source_user_id)
         if source_username:
             entry["source_username"] = str(source_username)
+        if source_chat_username:
+            entry["source_chat_username"] = str(source_chat_username)
         quote_stats[quote_key] = entry
     else:
         voters = entry.get("voters")
@@ -614,12 +617,15 @@ def ensure_quote_stats_entry(
             entry["source_user_id"] = int(source_user_id)
         if source_username and not entry.get("source_username"):
             entry["source_username"] = str(source_username)
+        if source_chat_username and not entry.get("source_chat_username"):
+            entry["source_chat_username"] = str(source_chat_username)
     return entry
 
 
 def format_quote_source(entry: dict[str, Any]) -> str:
     source_chat_id = entry.get("source_chat_id")
     source_message_id = entry.get("source_message_id")
+    source_chat_username = entry.get("source_chat_username")
     if source_chat_id is None or source_message_id is None:
         return "Источник неизвестен"
 
@@ -628,10 +634,13 @@ def format_quote_source(entry: dict[str, Any]) -> str:
     except (TypeError, ValueError):
         return "Источник неизвестен"
 
-    if chat_id < 0:
-        return f"https://t.me/c/{abs(chat_id)}/{source_message_id}"
+    if source_chat_username:
+        return f"https://t.me/{source_chat_username}/{source_message_id}"
 
-    return f"Личное сообщение#{source_message_id}"
+    if chat_id > 0:
+        return f"Личное сообщение#{source_message_id}"
+
+    return f"Чат #{abs(chat_id)} · сообщение #{source_message_id}"
 
 
 def build_feedback_markup(text: str) -> InlineKeyboardMarkup:
@@ -861,6 +870,7 @@ async def send_quote_with_feedback(
     source_message_id: int | None = None,
     source_user_id: int | None = None,
     source_username: str | None = None,
+    source_chat_username: str | None = None,
 ) -> None:
     ensure_quote_stats_entry(
         reply_text,
@@ -868,6 +878,7 @@ async def send_quote_with_feedback(
         source_message_id=source_message_id,
         source_user_id=source_user_id,
         source_username=source_username,
+        source_chat_username=source_chat_username,
     )
     display_text = build_quote_display_text(reply_text)
     markup = build_feedback_markup(reply_text)
@@ -1117,6 +1128,7 @@ async def handle_quote_command(message: Message):
         source_message_id=replied.message_id,
         source_user_id=getattr(replied.from_user, "id", None),
         source_username=getattr(replied.from_user, "username", None) or getattr(replied.from_user, "first_name", None),
+        source_chat_username=getattr(replied.chat, "username", None),
     )
 
 
@@ -1282,6 +1294,7 @@ async def handle_general_templates(message: Message):
                 source_message_id=message.message_id,
                 source_user_id=getattr(message.from_user, "id", None),
                 source_username=getattr(message.from_user, "username", None) or getattr(message.from_user, "first_name", None),
+                source_chat_username=getattr(message.chat, "username", None),
             )
         except Exception as e:
             print(f"Ошибка периодического reply: {e}")
