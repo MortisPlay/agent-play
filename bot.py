@@ -29,9 +29,14 @@ FONT_PATH = os.getenv("FONT_PATH", "Roboto-Bold.ttf")
 BOT_USERNAME: str | None = None
 DATA_DIR = Path(__file__).resolve().parent
 STATS_PATH = DATA_DIR / "quote_stats.json"
+CHAT_SETTINGS_PATH = DATA_DIR / "chat_settings.json"
 ADMIN_IDS = {int(item) for item in os.getenv("ADMIN_IDS", "").split(",") if item.strip().isdigit()}
 AUTO_QUOTE_ENABLED = True
 AI_RESPONSE_ENABLED = True
+chat_settings: dict[str, dict[str, Any]] = {}
+pending_suggestions: dict[int, int] = {}
+pending_admin_comments: dict[int, str] = {}
+suggestion_anonymity: dict[int, bool] = {}
 
 # Инициализация бота и клиента ИИ
 bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
@@ -88,6 +93,7 @@ ai_client = AsyncOpenAI(
 )
 
 quote_stats: dict[str, dict[str, Any]] = {}
+suggestion_requests: dict[str, dict[str, Any]] = {}
 
 try:
     from PIL import Image, ImageDraw, ImageFont, ImageOps
@@ -106,24 +112,144 @@ def is_admin_user(user: Any | None) -> bool:
     return int(getattr(user, "id", 0)) in ADMIN_IDS
 
 
-def build_admin_markup() -> InlineKeyboardMarkup:
+def load_chat_settings() -> dict[str, dict[str, Any]]:
+    global chat_settings
+    if CHAT_SETTINGS_PATH.exists():
+        try:
+            with CHAT_SETTINGS_PATH.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            if isinstance(data, dict):
+                chat_settings = data
+        except Exception:
+            chat_settings = {}
+    else:
+        chat_settings = {}
+    return chat_settings
+
+
+def save_chat_settings() -> None:
+    with CHAT_SETTINGS_PATH.open("w", encoding="utf-8") as handle:
+        json.dump(chat_settings, handle, ensure_ascii=False, indent=2)
+
+
+def get_chat_setting(chat_id: int | None, key: str, default: Any = True) -> Any:
+    if chat_id is None:
+        return default
+    settings = chat_settings.get(str(chat_id)) or {}
+    return settings.get(key, default)
+
+
+def set_chat_setting(chat_id: int | None, key: str, value: Any) -> None:
+    if chat_id is None:
+        return
+    key_str = str(chat_id)
+    entry = chat_settings.get(key_str)
+    if not isinstance(entry, dict):
+        entry = {}
+        chat_settings[key_str] = entry
+    entry[key] = value
+    save_chat_settings()
+
+
+def build_admin_markup(chat_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text=f"🧠 AI: {'вкл' if AI_RESPONSE_ENABLED else 'выкл'}",
-                    callback_data="admin_toggle_ai",
+                    text=f"🧠 AI: {'вкл' if get_chat_setting(chat_id, 'ai_enabled', True) else 'выкл'}",
+                    callback_data=f"admin_toggle:ai:{chat_id}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text=f"💬 Автоцитаты: {'вкл' if AUTO_QUOTE_ENABLED else 'выкл'}",
-                    callback_data="admin_toggle_quotes",
+                    text=f"💬 Автоцитаты: {'вкл' if get_chat_setting(chat_id, 'auto_quote_enabled', True) else 'выкл'}",
+                    callback_data=f"admin_toggle:auto_quote:{chat_id}",
                 )
             ],
-            [InlineKeyboardButton(text="📊 Статус", callback_data="admin_status")],
+            [
+                InlineKeyboardButton(
+                    text=f"📣 Приветствие: {'вкл' if get_chat_setting(chat_id, 'welcome_enabled', True) else 'выкл'}",
+                    callback_data=f"admin_toggle:welcome:{chat_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"💡 Предложка: {'вкл' if get_chat_setting(chat_id, 'suggestion_button_enabled', True) else 'выкл'}",
+                    callback_data=f"admin_toggle:suggestion:{chat_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"🔗 Приложение: {'вкл' if get_chat_setting(chat_id, 'app_button_enabled', True) else 'выкл'}",
+                    callback_data=f"admin_toggle:app:{chat_id}",
+                )
+            ],
+            [InlineKeyboardButton(text="📊 Статус", callback_data=f"admin_status:{chat_id}")],
         ]
     )
+
+
+def build_welcome_markup(chat_id: int | None = None) -> InlineKeyboardMarkup:
+    buttons: list[list[InlineKeyboardButton]] = []
+    if get_chat_setting(chat_id, 'app_button_enabled', True):
+        buttons.append([InlineKeyboardButton(text="🚀 Открыть приложение", web_app=WebAppInfo(url="https://mortisplay.ru"))])
+    if get_chat_setting(chat_id, 'suggestion_button_enabled', True):
+        buttons.append([InlineKeyboardButton(text="💡 Кинуть предложку", callback_data="suggestion_open")])
+    if not buttons:
+        return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🚀 Открыть приложение", web_app=WebAppInfo(url="https://mortisplay.ru"))]])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def send_suggestion_to_admin(message: Message, chat_id: int, suggestion_id: str, anonymous: bool) -> None:
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Принять", callback_data=f"suggestion_accept:{suggestion_id}"),
+                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"suggestion_decline:{suggestion_id}"),
+            ],
+            [InlineKeyboardButton(text="💬 Комментарий", callback_data=f"suggestion_comment:{suggestion_id}")],
+        ]
+    )
+
+    user = getattr(message, "from_user", None)
+    full_name_parts = [
+        part for part in [getattr(user, "first_name", None), getattr(user, "last_name", None)] if part
+    ]
+    full_name = " ".join(full_name_parts) if full_name_parts else "Пользователь"
+    username = getattr(user, "username", None)
+    user_id = getattr(user, "id", None)
+
+    lines: list[str] = ["💡 Новая предложка"]
+    if not anonymous and user_id is not None:
+        line = f"От: {full_name}"
+        if username:
+            line += f" (@{username})"
+        line += f"\nID: {user_id}"
+        lines.append(line)
+
+    caption_text = message.text or message.caption or ""
+    if caption_text:
+        lines.append("")
+        lines.append(caption_text)
+
+    base_text = "\n".join(lines).strip()
+
+    try:
+        if message.photo:
+            await bot.send_photo(chat_id=chat_id, photo=message.photo[-1].file_id, caption=base_text, reply_markup=markup)
+        elif message.video:
+            await bot.send_video(chat_id=chat_id, video=message.video.file_id, caption=base_text, reply_markup=markup)
+        elif message.voice:
+            await bot.send_voice(chat_id=chat_id, voice=message.voice.file_id, caption=base_text, reply_markup=markup)
+        elif message.audio:
+            await bot.send_audio(chat_id=chat_id, audio=message.audio.file_id, caption=base_text, reply_markup=markup)
+        elif message.document:
+            await bot.send_document(chat_id=chat_id, document=message.document.file_id, caption=base_text, reply_markup=markup)
+        else:
+            await bot.send_message(chat_id=chat_id, text=base_text, reply_markup=markup)
+    except Exception as exc:
+        print(f"Ошибка отправки предложки админам: {exc}")
+        traceback.print_exc()
 
 
 def load_quote_stats() -> dict[str, dict[str, Any]]:
@@ -147,6 +273,7 @@ def save_quote_stats() -> None:
 
 
 load_quote_stats()
+load_chat_settings()
 
 
 async def generate_ai_reply(prompt_text: str) -> str:
@@ -302,7 +429,7 @@ def select_relevant_messages(messages: list[str], max_items: int = 1) -> list[st
         lowered = text.lower()
         if len(text) <= 3:
             continue
-        if any(marker in lowered for marker in ["http://", "https://", "@", "/q", "/start", "/help"]):
+        if any(marker in lowered for marker in ["http://", "https://", "@", "/q", "/start", "/help", "/qs"]):
             continue
         if text.startswith("/"):
             continue
@@ -756,15 +883,32 @@ async def handle_admin_callbacks(callback: CallbackQuery):
         await callback.answer("Нет доступа.", show_alert=True)
         return
 
-    global AUTO_QUOTE_ENABLED, AI_RESPONSE_ENABLED
     data = callback.data or ""
+    chat_id = getattr(callback.message, "chat", None).id if callback.message else None
 
-    if data == "admin_toggle_ai":
-        AI_RESPONSE_ENABLED = not AI_RESPONSE_ENABLED
-        await callback.answer(f"ИИ-ответы {'включены' if AI_RESPONSE_ENABLED else 'выключены'}")
-    elif data == "admin_toggle_quotes":
-        AUTO_QUOTE_ENABLED = not AUTO_QUOTE_ENABLED
-        await callback.answer(f"Автоцитаты {'включены' if AUTO_QUOTE_ENABLED else 'выключены'}")
+    if data.startswith("admin_toggle:"):
+        _, field, target_chat_id = data.split(":", 2)
+        target_chat = int(target_chat_id) if target_chat_id.isdigit() else chat_id
+        if field == "ai":
+            new_value = not get_chat_setting(target_chat, "ai_enabled", True)
+            set_chat_setting(target_chat, "ai_enabled", new_value)
+            await callback.answer(f"ИИ-ответы {'включены' if new_value else 'выключены'}")
+        elif field == "auto_quote":
+            new_value = not get_chat_setting(target_chat, "auto_quote_enabled", True)
+            set_chat_setting(target_chat, "auto_quote_enabled", new_value)
+            await callback.answer(f"Автоцитаты {'включены' if new_value else 'выключены'}")
+        elif field == "welcome":
+            new_value = not get_chat_setting(target_chat, "welcome_enabled", True)
+            set_chat_setting(target_chat, "welcome_enabled", new_value)
+            await callback.answer(f"Приветствие {'включено' if new_value else 'выключено'}")
+        elif field == "suggestion":
+            new_value = not get_chat_setting(target_chat, "suggestion_button_enabled", True)
+            set_chat_setting(target_chat, "suggestion_button_enabled", new_value)
+            await callback.answer(f"Кнопка предложки {'включена' if new_value else 'выключена'}")
+        elif field == "app":
+            new_value = not get_chat_setting(target_chat, "app_button_enabled", True)
+            set_chat_setting(target_chat, "app_button_enabled", new_value)
+            await callback.answer(f"Кнопка приложения {'включена' if new_value else 'выключена'}")
     else:
         await callback.answer("Статус обновлён")
 
@@ -772,10 +916,94 @@ async def handle_admin_callbacks(callback: CallbackQuery):
         try:
             await callback.message.edit_text(
                 "Админ-панель\n\n"
-                f"• AI ответы: {'вкл' if AI_RESPONSE_ENABLED else 'выкл'}\n"
-                f"• Автоцитаты: {'вкл' if AUTO_QUOTE_ENABLED else 'выкл'}",
-                reply_markup=build_admin_markup(),
+                f"• AI ответы: {'вкл' if get_chat_setting(chat_id, 'ai_enabled', True) else 'выкл'}\n"
+                f"• Автоцитаты: {'вкл' if get_chat_setting(chat_id, 'auto_quote_enabled', True) else 'выкл'}\n"
+                f"• Приветствие: {'вкл' if get_chat_setting(chat_id, 'welcome_enabled', True) else 'выкл'}\n"
+                f"• Предложка: {'вкл' if get_chat_setting(chat_id, 'suggestion_button_enabled', True) else 'выкл'}\n"
+                f"• Приложение: {'вкл' if get_chat_setting(chat_id, 'app_button_enabled', True) else 'выкл'}",
+                reply_markup=build_admin_markup(chat_id or int(callback.message.chat.id)),
             )
+        except Exception:
+            pass
+
+
+@dp.callback_query(lambda callback: callback.data and callback.data.startswith("suggestion_"))
+async def handle_suggestion_callbacks(callback: CallbackQuery):
+    data = callback.data or ""
+    if data.startswith("suggestion_mode:"):
+        if not callback.from_user:
+            await callback.answer("Не удалось сохранить выбор.")
+            return
+        mode = data.split(":", 1)[1]
+        suggestion_anonymity[callback.from_user.id] = mode == "anon"
+        await callback.answer("Окей. Теперь отправьте текст или медиа.")
+        try:
+            await callback.message.answer("Отправьте текст, фото, видео или голосовое — админ увидит это и решит, принимать или отклонять.")
+        except Exception:
+            pass
+        return
+
+    if data == "suggestion_open":
+        if not callback.from_user:
+            await callback.answer("Не удалось начать предложение.")
+            return
+        pending_suggestions[callback.from_user.id] = callback.message.chat.id if callback.message else 0
+        suggestion_anonymity[callback.from_user.id] = False
+        await callback.answer("Выберите формат отправки.")
+        try:
+            await callback.message.answer(
+                "Отправить предложку анонимно?",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(text="🕵️ Анонимно", callback_data="suggestion_mode:anon"),
+                            InlineKeyboardButton(text="👤 Обычная", callback_data="suggestion_mode:public"),
+                        ]
+                    ]
+                ),
+            )
+        except Exception:
+            pass
+        return
+
+    if data.startswith("suggestion_accept:"):
+        suggestion_id = data.split(":", 1)[1]
+        entry = suggestion_requests.get(suggestion_id)
+        if entry:
+            await callback.answer("Предложка принята.")
+            try:
+                await callback.message.edit_text(f"✅ Принято\n\n{entry['text']}", reply_markup=None)
+            except Exception:
+                pass
+            if entry.get("user_id"):
+                try:
+                    await bot.send_message(chat_id=entry["user_id"], text="✅ Ваша предложка принята.")
+                except Exception:
+                    pass
+        return
+
+    if data.startswith("suggestion_decline:"):
+        suggestion_id = data.split(":", 1)[1]
+        entry = suggestion_requests.get(suggestion_id)
+        if entry:
+            await callback.answer("Предложка отклонена.")
+            try:
+                await callback.message.edit_text(f"❌ Отклонено\n\n{entry['text']}", reply_markup=None)
+            except Exception:
+                pass
+            if entry.get("user_id"):
+                try:
+                    await bot.send_message(chat_id=entry["user_id"], text="❌ Ваша предложка отклонена.")
+                except Exception:
+                    pass
+        return
+
+    if data.startswith("suggestion_comment:"):
+        suggestion_id = data.split(":", 1)[1]
+        pending_admin_comments[callback.from_user.id] = suggestion_id
+        await callback.answer("Напишите комментарий.")
+        try:
+            await callback.message.answer("Введите комментарий к предложке.")
         except Exception:
             pass
 
@@ -831,21 +1059,19 @@ async def handle_admin_panel(message: Message):
     if not is_admin_user(message.from_user):
         await message.reply("Нет доступа.")
         return
-    await message.reply("Админ-панель", reply_markup=build_admin_markup())
+    await message.reply("Админ-панель", reply_markup=build_admin_markup(message.chat.id))
 
 
 @dp.message(Command(commands=["start", "help"], ignore_case=True))
 async def handle_start_help(message: Message):
-    markup = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Открыть приложение🤘", web_app=WebAppInfo(url="https://mortisplay.ru"))]
-        ]
-    )
+    if not get_chat_setting(message.chat.id, 'welcome_enabled', True):
+        return
     await message.answer(
-        "Привет! Я — бот-агент. Упомяни меня в сообщении и задайте вопрос,\n"
-        "например: @bot_username Как мне сделать X?\n"
-        "А также в нашем агент-боте есть наш собственный сайт! Заходите и смотрите наши видеоролики ПРЯМО С НАШЕГО БОТА!",
-        reply_markup=markup,
+        "Привет! Я — бот-агент. Упомяни меня в сообщении и задай вопрос,\n"
+        "например: @bot_username Как мне сделать X?\n\n"
+        "Если хочешь внести идею или предложку — нажми кнопку ниже.\n"
+        "А ещё у нас есть крутое приложение с видео и обновлениями ✨",
+        reply_markup=build_welcome_markup(message.chat.id),
     )
 
 
@@ -927,11 +1153,6 @@ async def handle_top_quotes(message: Message):
     await message.reply("Топ 5 оценённых цитат:\n" + "\n\n".join(lines), parse_mode="HTML")
 
 
-@dp.message(Command(commands=["qs"], ignore_case=True))
-async def handle_qs_removed(message: Message):
-    await message.reply("Команда /qs временно отключена. Используйте /sticker или /savequote.")
-
-
 @dp.message(Command(commands=["sticker", "savequote"], ignore_case=True))
 async def handle_save_quote_sticker(message: Message):
     if not message.reply_to_message:
@@ -978,6 +1199,32 @@ async def handle_general_templates(message: Message):
     if message.from_user and message.from_user.is_bot:
         return
 
+    if message.from_user and message.from_user.id in pending_suggestions:
+        chat_id = pending_suggestions.pop(message.from_user.id)
+        anonymous = suggestion_anonymity.pop(message.from_user.id, False)
+        suggestion_id = hashlib.sha256(f"{message.from_user.id}:{time.time()}".encode("utf-8")).hexdigest()[:10]
+        suggestion_requests[suggestion_id] = {
+            "text": message.text or message.caption or "",
+            "user_id": message.from_user.id,
+            "chat_id": chat_id,
+            "anonymous": anonymous,
+        }
+        await send_suggestion_to_admin(message, chat_id if chat_id else message.chat.id, suggestion_id, anonymous)
+        await message.reply("Предложка отправлена админам.")
+        return
+
+    if message.from_user and message.from_user.id in pending_admin_comments:
+        suggestion_id = pending_admin_comments.pop(message.from_user.id)
+        entry = suggestion_requests.get(suggestion_id)
+        if entry:
+            text = message.text or message.caption or ""
+            try:
+                await bot.send_message(chat_id=entry["user_id"], text=f"💬 Комментарий от админа:\n\n{text}")
+            except Exception:
+                pass
+            await message.reply("Комментарий отправлен пользователю.")
+        return
+
     global BOT_USERNAME
     if not BOT_USERNAME:
         try:
@@ -986,7 +1233,7 @@ async def handle_general_templates(message: Message):
         except Exception:
             BOT_USERNAME = None
 
-    if AI_RESPONSE_ENABLED and BOT_USERNAME and f"@{BOT_USERNAME.lower()}" in text.lower():
+    if get_chat_setting(message.chat.id, 'ai_enabled', True) and BOT_USERNAME and f"@{BOT_USERNAME.lower()}" in text.lower():
         clean_text = re.sub(rf"@{re.escape(BOT_USERNAME)}", "", text, flags=re.I).strip()
         if not clean_text:
             await message.reply("Да? Чем помочь? Напишите вопрос после упоминания бота.")
@@ -1023,7 +1270,7 @@ async def handle_general_templates(message: Message):
         await message.reply(random.choice(answers))
         return
 
-    if AUTO_QUOTE_ENABLED and random.random() < 0.08:
+    if get_chat_setting(message.chat.id, 'auto_quote_enabled', True) and random.random() < 0.08:
         try:
             await bot.send_chat_action(chat_id=message.chat.id, action="typing")
             reply_text = await generate_quote_reply(text, None, text)
