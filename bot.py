@@ -813,10 +813,12 @@ def format_quote_source(entry: dict[str, Any], bot_username: str | None = None) 
         return f'<a href="{html.escape(url, quote=True)}">{html.escape(label)}</a>'
 
     if chat_id > 0:
+        # Private (personal) chat with the bot: there is no reliable per-message deep-link.
+        # Provide a link to the bot profile (so user can open the dialog) and show message id as copyable code.
         if normalized_bot_username:
-            url = f"https://t.me/{normalized_bot_username}?start=msg_{message_id}"
-            label = f"Личное сообщение №{message_id}"
-            return f'<a href="{html.escape(url, quote=True)}">{html.escape(label)}</a>'
+            bot_url = f"https://t.me/{normalized_bot_username}"
+            label = f"Личный диалог с @{normalized_bot_username}"
+            return f'<a href="{html.escape(bot_url, quote=True)}">{html.escape(label)}</a> · <code>сообщение №{message_id}</code>'
         return f"<code>Личное сообщение №{message_id}</code>"
 
     if chat_id < 0:
