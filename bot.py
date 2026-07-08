@@ -785,7 +785,7 @@ def ensure_quote_stats_entry(
     return entry
 
 
-def format_quote_source(entry: dict[str, Any]) -> str:
+def format_quote_source(entry: dict[str, Any], bot_username: str | None = None) -> str:
     source_chat_id = entry.get("source_chat_id")
     source_message_id = entry.get("source_message_id")
     source_chat_username = entry.get("source_chat_username")
@@ -794,16 +794,37 @@ def format_quote_source(entry: dict[str, Any]) -> str:
 
     try:
         chat_id = int(source_chat_id)
+        message_id = int(source_message_id)
     except (TypeError, ValueError):
         return "Источник неизвестен"
 
-    if source_chat_username:
-        return f"https://t.me/{source_chat_username}/{source_message_id}"
+    def safe_username(value: str | None) -> str | None:
+        if not value:
+            return None
+        cleaned = str(value).strip().lstrip("@")
+        return cleaned or None
+
+    normalized_chat_username = safe_username(source_chat_username)
+    normalized_bot_username = safe_username(bot_username or BOT_USERNAME)
+
+    if normalized_chat_username:
+        url = f"https://t.me/{normalized_chat_username}/{message_id}"
+        label = f"t.me/{normalized_chat_username}/{message_id}"
+        return f'<a href="{html.escape(url, quote=True)}">{html.escape(label)}</a>'
 
     if chat_id > 0:
-        return f"Личное сообщение#{source_message_id}"
+        if normalized_bot_username:
+            url = f"https://t.me/{normalized_bot_username}?start=msg_{message_id}"
+            label = f"Личное сообщение №{message_id}"
+            return f'<a href="{html.escape(url, quote=True)}">{html.escape(label)}</a>'
+        return f"<code>Личное сообщение №{message_id}</code>"
 
-    return f"Чат #{abs(chat_id)} · сообщение #{source_message_id}"
+    if chat_id < 0:
+        url = f"https://t.me/c/{abs(chat_id)}/{message_id}"
+        label = f"Чат #{abs(chat_id)} · сообщение #{message_id}"
+        return f'<a href="{html.escape(url, quote=True)}">{html.escape(label)}</a>'
+
+    return f"<code>Источник №{message_id}</code>"
 
 
 def build_feedback_markup(text: str) -> InlineKeyboardMarkup:
@@ -1300,7 +1321,7 @@ async def handle_top_quotes(message: Message):
         text = html.escape(str(item.get("text", "—")))
         likes = int(item.get("likes", 0))
         dislikes = int(item.get("dislikes", 0))
-        source = html.escape(format_quote_source(item))
+        source = format_quote_source(item, BOT_USERNAME)
         lines.append(
             f"{idx + 1}. <b>{text}</b> — 👍 {likes} 👎 {dislikes}\nИсточник: {source}"
         )
