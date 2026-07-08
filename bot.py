@@ -212,6 +212,68 @@ def build_welcome_markup(chat_id: int | None = None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
+def get_suggestion_content(message: Message) -> str:
+    text = (getattr(message, "text", None) or "").strip()
+    caption = (getattr(message, "caption", None) or "").strip()
+
+    if text and caption and text != caption:
+        return f"{text}\n\n{caption}"
+    if text:
+        return text
+    if caption:
+        return caption
+    return ""
+
+
+def get_message_content(message: Message) -> str:
+    text = (getattr(message, "text", None) or "").strip()
+    caption = (getattr(message, "caption", None) or "").strip()
+
+    if text and caption and text != caption:
+        return f"{text}\n\n{caption}"
+    return text or caption or ""
+
+
+async def describe_photo_bytes(image_bytes: bytes) -> str:
+    if not OPENAI_API_KEY:
+        return ""
+
+    try:
+        encoded = base64.b64encode(image_bytes).decode("ascii")
+        response = await ai_client.chat.completions.create(
+            model="openai/gpt-4o-mini",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Кратко опиши изображение на русском в 1–2 фразах, только по содержанию.",
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
+                        },
+                    ],
+                }
+            ],
+            max_tokens=40,
+            temperature=0.2,
+        )
+        choices = getattr(response, "choices", None) or []
+        if not choices:
+            return ""
+        content = getattr(getattr(choices[0], "message", {}), "content", None)
+        if content:
+            return str(content).strip()
+    except Exception as exc:
+        if is_openrouter_payment_required_error(exc):
+            print("Ошибка распознавания фото: недостаточно средств на OpenRouter для изображения.")
+        else:
+            print(f"Ошибка распознавания фото: {exc}")
+    return ""
+
+
 async def send_suggestion_to_admin(message: Message, chat_id: int, suggestion_id: str, anonymous: bool) -> None:
     markup = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -239,7 +301,7 @@ async def send_suggestion_to_admin(message: Message, chat_id: int, suggestion_id
         line += f"\nID: {user_id}"
         lines.append(line)
 
-    caption_text = message.text or message.caption or ""
+    caption_text = get_suggestion_content(message)
     if caption_text:
         lines.append("")
         lines.append(caption_text)
@@ -393,10 +455,14 @@ async def generate_ai_reply(prompt_text: str) -> str:
 
 
 async def download_file_bytes(file_id: str) -> bytes:
-    file = await bot.get_file(file_id)
-    buffer = io.BytesIO()
-    await bot.download_file(file.file_path, buffer)
-    return buffer.getvalue()
+    try:
+        file = await bot.get_file(file_id)
+        buffer = io.BytesIO()
+        await bot.download_file(file.file_path, buffer)
+        return buffer.getvalue()
+    except Exception as exc:
+        print(f"Ошибка загрузки файла из Telegram: {exc}")
+        return b""
 
 
 def guess_audio_format(mime_type: str | None) -> str:
@@ -434,6 +500,21 @@ def is_openrouter_access_denied_error(error: Exception) -> bool:
     return "access denied by security policy" in message or "error code: 403" in message or "403" in message
 
 
+def is_openrouter_payment_required_error(error: Exception) -> bool:
+    message = str(error).lower()
+    if hasattr(error, "response") and error.response is not None:
+        status_code = getattr(error.response, "status_code", None)
+        if status_code == 402:
+            return True
+        try:
+            body_text = error.response.text
+            if body_text:
+                message += " " + body_text.lower()
+        except Exception:
+            pass
+    return "payment required" in message or "requires at least" in message or "balance" in message or "402" in message
+
+
 async def transcribe_audio_bytes(audio_bytes: bytes, audio_format: str = "ogg") -> str:
     payload = {
         "model": "openai/whisper-large-v3",
@@ -456,6 +537,9 @@ async def transcribe_audio_bytes(audio_bytes: bytes, audio_format: str = "ogg") 
             data = response.json()
             return data.get("text", "").strip()
     except Exception as e:
+        if is_openrouter_payment_required_error(e):
+            print("Ошибка транскрипции: недостаточно средств на OpenRouter для аудио.")
+            return ""
         print(f"Ошибка транскрипции: {e}")
         if hasattr(e, "response") and e.response is not None:
             try:
@@ -806,34 +890,6 @@ async def extract_text_source(message: Message) -> str:
     if text:
         return text
 
-    file_id = None
-    mime_type = None
-    if message.voice:
-        file_id = message.voice.file_id
-        mime_type = message.voice.mime_type
-    elif message.audio:
-        file_id = message.audio.file_id
-        mime_type = message.audio.mime_type
-    elif message.video_note:
-        file_id = message.video_note.file_id
-        mime_type = message.video_note.mime_type
-    elif message.video:
-        file_id = message.video.file_id
-        mime_type = message.video.mime_type
-    elif message.document and message.document.mime_type:
-        if message.document.mime_type.startswith("audio/") or message.document.mime_type.startswith("video/"):
-            file_id = message.document.file_id
-            mime_type = message.document.mime_type
-
-    if file_id:
-        try:
-            audio_bytes = await download_file_bytes(file_id)
-            audio_format = guess_audio_format(mime_type)
-            transcript = await transcribe_audio_bytes(audio_bytes, audio_format)
-            return transcript
-        except Exception as e:
-            print(f"Ошибка получения/транскрипции медиа: {e}")
-            traceback.print_exc()
     return ""
 
 
@@ -961,10 +1017,14 @@ async def send_quote_with_feedback(
     )
     display_text = build_quote_display_text(reply_text)
     markup = build_feedback_markup(reply_text)
-    if reply_to_message_id:
-        await bot.send_message(chat_id=chat_id, text=display_text, reply_to_message_id=reply_to_message_id, reply_markup=markup)
-    else:
-        await bot.send_message(chat_id=chat_id, text=display_text, reply_markup=markup)
+    try:
+        if reply_to_message_id:
+            await bot.send_message(chat_id=chat_id, text=display_text, reply_to_message_id=reply_to_message_id, reply_markup=markup)
+        else:
+            await bot.send_message(chat_id=chat_id, text=display_text, reply_markup=markup)
+    except Exception as exc:
+        print(f"Ошибка отправки AI-цитаты: {exc}")
+        traceback.print_exc()
 
 
 @dp.callback_query(lambda callback: callback.data and callback.data.startswith("admin_"))
@@ -1197,7 +1257,11 @@ async def handle_quote_command(message: Message):
 
     merged_text = " \n".join(relevant_messages)
     resolved_style = get_quote_style(explicit_style) if explicit_style else infer_quote_style(merged_text, text)
-    await bot.send_chat_action(chat_id=message.chat.id, action="typing")
+    try:
+        await bot.send_chat_action(chat_id=message.chat.id, action="typing")
+    except Exception as exc:
+        print(f"Ошибка отправки typing action: {exc}")
+
     reply_text = await generate_quote_reply(merged_text, resolved_style, text)
     await send_quote_with_feedback(
         message.chat.id,
@@ -1281,8 +1345,9 @@ async def handle_save_quote_sticker(message: Message):
 
 @dp.message()
 async def handle_general_templates(message: Message):
-    text = (message.text or message.caption or "").strip()
-    if not text:
+    text = get_message_content(message).strip()
+    has_media = any([message.photo, message.video, message.video_note, message.voice, message.audio, message.document])
+    if not text and not has_media:
         return
 
     if message.text and message.text.startswith("/"):
@@ -1295,7 +1360,7 @@ async def handle_general_templates(message: Message):
         anonymous = suggestion_anonymity.pop(message.from_user.id, False)
         suggestion_id = hashlib.sha256(f"{message.from_user.id}:{time.time()}".encode("utf-8")).hexdigest()[:10]
         suggestion_requests[suggestion_id] = {
-            "text": message.text or message.caption or "",
+            "text": get_suggestion_content(message),
             "user_id": message.from_user.id,
             "chat_id": chat_id,
             "anonymous": anonymous,
@@ -1330,7 +1395,10 @@ async def handle_general_templates(message: Message):
             await message.reply("Да? Чем помочь? Напишите вопрос после упоминания бота.")
             return
 
-        await bot.send_chat_action(chat_id=message.chat.id, action="typing")
+        try:
+            await bot.send_chat_action(chat_id=message.chat.id, action="typing")
+        except Exception as exc:
+            print(f"Ошибка отправки typing action: {exc}")
         status = await message.reply("🤖 Думаю...")
         try:
             ai_resp = await generate_ai_reply(clean_text)
@@ -1361,10 +1429,20 @@ async def handle_general_templates(message: Message):
         await message.reply(random.choice(answers))
         return
 
-    if get_chat_setting(message.chat.id, 'auto_quote_enabled', True) and random.random() < 0.08:
+    reply_to_ai_quote = bool(message.reply_to_message and is_ai_quote_message(message.reply_to_message))
+    should_generate_quote = reply_to_ai_quote or (
+        get_chat_setting(message.chat.id, 'auto_quote_enabled', True) and random.random() < 0.08
+    )
+    if should_generate_quote:
         try:
-            await bot.send_chat_action(chat_id=message.chat.id, action="typing")
-            reply_text = await generate_quote_reply(text, None, text)
+            source_text = text or await extract_text_source(message)
+            if not source_text.strip():
+                return
+            try:
+                await bot.send_chat_action(chat_id=message.chat.id, action="typing")
+            except Exception as exc:
+                print(f"Ошибка отправки typing action: {exc}")
+            reply_text = await generate_quote_reply(source_text, None, source_text)
             await send_quote_with_feedback(
                 message.chat.id,
                 None,
@@ -1376,7 +1454,7 @@ async def handle_general_templates(message: Message):
                 source_chat_username=getattr(message.chat, "username", None),
             )
         except Exception as e:
-            print(f"Ошибка периодического reply: {e}")
+            print(f"Ошибка генерации AI-цитаты: {e}")
             traceback.print_exc()
 
 
