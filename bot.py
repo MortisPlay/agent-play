@@ -1025,6 +1025,7 @@ async def handle_suggestion_callbacks(callback: CallbackQuery):
             await callback.answer("Не удалось сохранить выбор.")
             return
         mode = data.split(":", 1)[1]
+        pending_suggestions[callback.from_user.id] = callback.message.chat.id if callback.message else 0
         suggestion_anonymity[callback.from_user.id] = mode == "anon"
         await callback.answer("Окей. Теперь отправьте текст или медиа.")
         try:
@@ -1037,7 +1038,7 @@ async def handle_suggestion_callbacks(callback: CallbackQuery):
         if not callback.from_user:
             await callback.answer("Не удалось начать предложение.")
             return
-        pending_suggestions[callback.from_user.id] = callback.message.chat.id if callback.message else 0
+        pending_suggestions.pop(callback.from_user.id, None)
         suggestion_anonymity[callback.from_user.id] = False
         await callback.answer("Выберите формат отправки.")
         try:
