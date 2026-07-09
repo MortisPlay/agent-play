@@ -18,7 +18,6 @@ from aiogram import Bot, Dispatcher
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo
-from aiogram.types.input_file import BufferedInputFile
 from openai import AsyncOpenAI
 import httpx
 
@@ -26,7 +25,9 @@ import httpx
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-FONT_PATH = os.getenv("FONT_PATH", "Roboto-Bold.ttf")
+MODEL_CHAT = os.getenv("MODEL_CHAT", "meta-llama/llama-3.1-8b-instruct")
+MODEL_VISION = os.getenv("MODEL_VISION", "openai/gpt-4o-mini")
+MODEL_WHISPER = os.getenv("MODEL_WHISPER", "openai/whisper-large-v3")
 BOT_USERNAME: str | None = None
 
 
@@ -66,7 +67,6 @@ HELP_TEXT = (
     "• Упомяни меня в чате и задай вопрос — я отвечу как агент.\n"
     "• Ответь на сообщение командой /q — я сделаю из него цитату.\n"
     "• Используй /top, чтобы посмотреть самые оценённые цитаты.\n"
-    "• Отправь /sticker в ответ на AI-цитату, чтобы сохранить её как стикер.\n"
     "• Нажми кнопку ниже, если хочешь отправить предложку."
 )
 
@@ -126,14 +126,6 @@ ai_client = AsyncOpenAI(
 
 quote_stats: dict[str, dict[str, Any]] = {}
 suggestion_requests: dict[str, dict[str, Any]] = {}
-
-try:
-    from PIL import Image, ImageDraw, ImageFont, ImageOps
-except Exception:  # pragma: no cover - optional dependency for stickers
-    Image = None
-    ImageDraw = None
-    ImageFont = None
-    ImageOps = None
 
 
 def is_admin_user(user: Any | None) -> bool:
@@ -241,7 +233,7 @@ async def describe_photo_bytes(image_bytes: bytes) -> str:
     try:
         encoded = base64.b64encode(image_bytes).decode("ascii")
         response = await ai_client.chat.completions.create(
-            model="openai/gpt-4o-mini",
+            model=MODEL_VISION,
             messages=[
                 {
                     "role": "user",
@@ -330,7 +322,38 @@ def init_storage_db() -> None:
     with sqlite3.connect(DB_PATH) as connection:
         connection.execute("CREATE TABLE IF NOT EXISTS quote_stats (key TEXT PRIMARY KEY, payload TEXT NOT NULL)")
         connection.execute("CREATE TABLE IF NOT EXISTS chat_settings (chat_id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS chat_history (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT, message_text TEXT, timestamp REAL)"
+        )
         connection.commit()
+
+
+def save_message_to_history(chat_id: int, text: str) -> None:
+    cleaned = re.sub(r"\s+", " ", text or "").strip()
+    if not cleaned:
+        return
+    init_storage_db()
+    with sqlite3.connect(DB_PATH) as connection:
+        connection.execute(
+            "INSERT INTO chat_history (chat_id, message_text, timestamp) VALUES (?, ?, ?)",
+            (str(chat_id), cleaned, time.time()),
+        )
+        connection.commit()
+
+
+def get_recent_chat_context(chat_id: int, limit: int = 15) -> str:
+    init_storage_db()
+    with sqlite3.connect(DB_PATH) as connection:
+        rows = connection.execute(
+            "SELECT message_text FROM chat_history WHERE chat_id = ? ORDER BY id DESC LIMIT ?",
+            (str(chat_id), max(1, int(limit))),
+        ).fetchall()
+    if not rows:
+        return ""
+    messages = [row[0] for row in rows if row and row[0]]
+    messages.reverse()
+    formatted = "\n".join(f"- {item}" for item in messages)
+    return f"Контекст последних сообщений в чате:\n{formatted}"
 
 
 def load_quote_stats() -> dict[str, dict[str, Any]]:
@@ -432,7 +455,7 @@ async def generate_ai_reply(prompt_text: str) -> str:
 
     try:
         response = await ai_client.chat.completions.create(
-            model="meta-llama/llama-3.1-8b-instruct",
+            model=MODEL_CHAT,
             messages=messages,
             max_tokens=180,
             temperature=0.7,
@@ -517,7 +540,7 @@ def is_openrouter_payment_required_error(error: Exception) -> bool:
 
 async def transcribe_audio_bytes(audio_bytes: bytes, audio_format: str = "ogg") -> str:
     payload = {
-        "model": "openai/whisper-large-v3",
+        "model": MODEL_WHISPER,
         "input_audio": {
             "data": base64.b64encode(audio_bytes).decode("ascii"),
             "format": audio_format,
@@ -589,30 +612,15 @@ def select_relevant_messages(messages: list[str], max_items: int = 1) -> list[st
         text = re.sub(r"\s+", " ", item).strip()
         if not text:
             continue
-        lowered = text.lower()
-        if len(text) <= 3:
-            continue
-        if any(marker in lowered for marker in ["http://", "https://", "@", "/q", "/start", "/help", "/qs"]):
-            continue
         if text.startswith("/"):
             continue
         filtered.append(text)
 
     if not filtered:
-        return messages[:max_items]
-
+        return []
     if max_items <= 1:
         return [filtered[0]]
-
-    selected = []
-    for text in filtered:
-        if len(text) >= 8 or len(selected) < 1:
-            selected.append(text)
-        if len(selected) >= max_items:
-            break
-    if len(selected) < max_items:
-        selected.extend(filtered[: max_items - len(selected)])
-    return selected
+    return filtered[:max_items]
 
 
 async def collect_reply_context(message: Message | None, max_messages: int) -> list[str]:
@@ -635,6 +643,7 @@ async def collect_reply_context(message: Message | None, max_messages: int) -> l
 
         current = current.reply_to_message
 
+    collected.reverse()
     return collected
 
 
@@ -848,42 +857,41 @@ def build_quote_display_text(text: str) -> str:
     return text.strip()
 
 
-async def generate_quote_reply(text: str, style: str | None = None, command_text: str = "") -> str:
+async def generate_quote_reply(text: str, style: str | None = None, command_text: str = "", chat_id: int | None = None) -> str:
     text = text.strip()
     if not text:
         return "Ничего не вижу, только тишина и твой вайб 😏"
 
     resolved_style = get_quote_style(style) if style else infer_quote_style(text, command_text)
+    system_prompt = {
+        "genz": "Ты — зумер-токсик из комментов Telegram. Пиши исключительно на современном русском молодежном сленге. Отвечай максимально вайбово, с легкой дерзостью, как в чате с корешами.",
+        "roast": "Ты — мастер жесткого роаста и подколов. Твоя задача — едко высмеять сообщение пользователя, найти в нем уязвимость или глупость и разнести фактами с жестким юмором.",
+        "toxic": "Ты — душный, саркастичный и максимально зубастый критик. Твои ответы режут как нож, наполнены чистым сарказмом и иронией.",
+    }.get(resolved_style, "Ты — талантливый автор саркастичных и стильных reply-ответов в Telegram.")
+    context_block = get_recent_chat_context(chat_id, limit=8) if chat_id is not None else ""
     prompt = (
         "Ты — автор очень живых, умных и остроумных reply-цитат для Telegram. "
         "Ты отлично понимаешь смысл сообщения, улавливаешь подтекст и отвечаешь так, чтобы это звучало ярко, "
         "с характером и с богатым словарным запасом. "
         f"Стиль ответа: {resolved_style}.\n"
         "Правила:\n"
-        "- Отвечай ТОЛЬКО на русском языке. Никакого английского, никаких чужих языков.\n"
-        "- Если стиль genz — отвечай современно, вайбово, с лёгкой дерзостью и живым сленгом, будто ты в чате с очень уверенным пацаном.\n"
-        "- Если стиль roast — отвечай дерзко, с подколом, едко, но не тупо; держи удар, но не превращайся в бессмысленную агрессию.\n"
-        "- Если стиль toxic — отвечай жёстко, саркастично, зубасто, с очень цепляющей подачей, будто ты режешь фразу как ножом.\n"
-        "- Делай ответы с юмором, шуткой, подколом и живой речью. Не будь сухим.\n"
-        "- Используй лёгкие характерные слова вроде 'бро', 'чел', 'вайб', 'мда', 'ну', 'по факту' — но умеренно, чтобы не звучать нелепо.\n"
-        "- Не делай слишком длинный ответ. 1–2 предложения максимум.\n"
-        "- Не используй шаблонные фразы, делай ответ по смыслу сообщения и по интонации.\n"
-        "- Сохраняй атмосферу Telegram, но с хорошей речью, характером и вкусом.\n"
-        "- Если в сообщении есть провокация, слабость, попытка выглядеть важным или вайб — отвечай с подколом.\n"
-        "- Если есть самоирония, неловкость или абсурд — отвечай веселее и проще.\n"
-        "- Используй смайлики, но естественно, без перебора.\n"
+        "- Пиши исключительно на современном русском молодежном сленге.\n"
+        "- Отвечай живо, по-русски и без английских слов.\n"
+        "- Держи ответ коротким: 1–2 предложения максимум.\n"
+        "- Создавай ответы по смыслу сообщения и по интонации, а не по шаблону.\n"
+        f"{context_block}\n" if context_block else ""
         f"Текст сообщения: {text}\n"
         "Верни только готовый ответ без объяснений и без кавычек."
     )
 
     try:
         response = await ai_client.chat.completions.create(
-            model="meta-llama/llama-3.1-8b-instruct",
+            model=MODEL_CHAT,
             messages=[
-                {"role": "system", "content": "Ты — талантливый автор саркастичных и стильных reply-ответов в Telegram."},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=70,
+            max_tokens=45,
             temperature=0.9,
             top_p=0.94,
             presence_penalty=0.2,
@@ -914,110 +922,6 @@ async def extract_text_source(message: Message) -> str:
         return text
 
     return ""
-
-
-async def get_user_avatar_bytes(user_id: int | None) -> bytes | None:
-    if not user_id or not bot:
-        return None
-    try:
-        photos = await bot.get_user_profile_photos(user_id)
-        if not getattr(photos, "photos", None) or not photos.photos:
-            return None
-        file_id = photos.photos[0][0].file_id
-        file = await bot.get_file(file_id)
-        buffer = io.BytesIO()
-        await bot.download_file(file.file_path, buffer)
-        return buffer.getvalue()
-    except Exception as exc:
-        print(f"Ошибка загрузки аватара: {exc}")
-        return None
-
-
-async def create_sticker_bytes(text: str, user_photo: bytes | None = None, username: str | None = None) -> bytes:
-    if Image is None or ImageDraw is None or ImageFont is None:
-        raise RuntimeError("Pillow не установлен")
-
-    width, height = 512, 512
-    image = Image.new("RGBA", (width, height), (16, 20, 30, 255))
-    draw = ImageDraw.Draw(image)
-
-    draw.rounded_rectangle((20, 20, width - 20, height - 20), radius=36, fill=(24, 28, 42, 255), outline=(87, 102, 129, 255), width=3)
-    draw.rounded_rectangle((34, 34, width - 34, height - 34), radius=28, fill=(12, 16, 25, 255))
-    draw.rectangle((36, 34, width - 36, 70), fill=(255, 107, 107, 255))
-
-    font_path = None
-    if os.path.exists(FONT_PATH):
-        font_path = FONT_PATH
-    elif os.path.exists(str(DATA_DIR / FONT_PATH)):
-        font_path = str(DATA_DIR / FONT_PATH)
-
-    font_title = None
-    font_body = None
-    if font_path:
-        try:
-            font_title = ImageFont.truetype(font_path, 28)
-            font_body = ImageFont.truetype(font_path, 30)
-        except Exception:
-            font_title = ImageFont.load_default()
-            font_body = ImageFont.load_default()
-    if font_title is None:
-        font_title = ImageFont.load_default()
-    if font_body is None:
-        font_body = ImageFont.load_default()
-
-    if user_photo:
-        try:
-            avatar = Image.open(io.BytesIO(user_photo)).convert("RGBA").resize((96, 96))
-            mask = Image.new("L", avatar.size, 0)
-            avatar_draw = ImageDraw.Draw(mask)
-            avatar_draw.ellipse((0, 0, avatar.size[0] - 1, avatar.size[1] - 1), fill=255)
-            avatar.putalpha(mask)
-            image.alpha_composite(avatar, dest=(44, 86))
-            draw.ellipse((44, 86, 44 + 96, 86 + 96), outline=(255, 255, 255, 255), width=3)
-        except Exception:
-            pass
-
-    label = "QuotLy"
-    draw.text((150, 62), label, fill=(255, 255, 255, 255), font=font_title)
-
-    display_name = (username or "anonymous").strip()
-    if display_name and not display_name.startswith("@"):
-        display_name = f"@{display_name}"
-    if not display_name:
-        display_name = "@anonymous"
-    display_name = display_name[:22]
-    draw.text((150, 96), display_name, fill=(188, 213, 255, 255), font=font_title)
-
-    quote_text = re.sub(r"\s+", " ", text).strip() or ""
-    if not quote_text:
-        quote_text = "Ничего не вижу, только тишина..."
-
-    max_width = width - 120
-    words = quote_text.split()
-    lines: list[str] = []
-    current_line = ""
-    for word in words:
-        test_line = f"{current_line} {word}".strip()
-        bbox = draw.textbbox((0, 0), test_line, font=font_body)
-        if bbox[2] <= max_width or not current_line:
-            current_line = test_line
-        else:
-            lines.append(current_line)
-            current_line = word
-    if current_line:
-        lines.append(current_line)
-    if not lines:
-        lines = [quote_text[:40]]
-
-    start_y = 152
-    line_height = 42
-    for index, line in enumerate(lines[:5]):
-        y = start_y + index * line_height
-        draw.text((44, y), line, fill=(255, 255, 255, 255), font=font_body)
-
-    output = io.BytesIO()
-    image.save(output, format="WEBP")
-    return output.getvalue()
 
 
 async def send_quote_with_feedback(
@@ -1269,23 +1173,41 @@ async def handle_quote_command(message: Message):
         else:
             explicit_style = first_arg
 
-    source_texts = await collect_reply_context(replied, count + 3)
-    if not source_texts:
-        await message.reply("Не нашёл ни одного текстового сообщения для объединения.")
+    source_text = ""
+    if replied.voice or replied.audio:
+        file_id = getattr(replied.voice, "file_id", None) or getattr(replied.audio, "file_id", None)
+        if file_id:
+            audio_bytes = await download_file_bytes(file_id)
+            if audio_bytes:
+                audio_format = guess_audio_format(getattr(replied.voice, "mime_type", None) or getattr(replied.audio, "mime_type", None))
+                source_text = await transcribe_audio_bytes(audio_bytes, audio_format)
+    elif replied.photo:
+        photo = max(replied.photo, key=lambda item: (getattr(item, "width", 0) or 0) * (getattr(item, "height", 0) or 0))
+        if photo:
+            photo_bytes = await download_file_bytes(photo.file_id)
+            if photo_bytes:
+                source_text = await describe_photo_bytes(photo_bytes)
+    else:
+        source_texts = await collect_reply_context(replied, max_messages=max(count + 3, 3))
+        if not source_texts:
+            await message.reply("Не нашёл ни одного текстового сообщения для объединения.")
+            return
+        relevant_messages = select_relevant_messages(source_texts, max_items=max(count, 1))
+        if not relevant_messages:
+            relevant_messages = source_texts[: max(count, 1)]
+        source_text = "\n".join(relevant_messages)
+
+    if not source_text.strip():
+        await message.reply("Не нашёл подходящего текста для цитаты.")
         return
 
-    relevant_messages = select_relevant_messages(source_texts, max_items=count)
-    if not relevant_messages:
-        relevant_messages = source_texts[:count]
-
-    merged_text = " \n".join(relevant_messages)
-    resolved_style = get_quote_style(explicit_style) if explicit_style else infer_quote_style(merged_text, text)
+    resolved_style = get_quote_style(explicit_style) if explicit_style else infer_quote_style(source_text, text)
     try:
         await bot.send_chat_action(chat_id=message.chat.id, action="typing")
     except Exception as exc:
         print(f"Ошибка отправки typing action: {exc}")
 
-    reply_text = await generate_quote_reply(merged_text, resolved_style, text)
+    reply_text = await generate_quote_reply(source_text, resolved_style, text, chat_id=message.chat.id)
     await send_quote_with_feedback(
         message.chat.id,
         message.message_id,
@@ -1331,45 +1253,12 @@ async def handle_top_quotes(message: Message):
     await message.reply("Топ 5 оценённых цитат:\n" + "\n\n".join(lines), parse_mode="HTML")
 
 
-@dp.message(Command(commands=["sticker", "savequote"], ignore_case=True))
-async def handle_save_quote_sticker(message: Message):
-    if not message.reply_to_message:
-        await message.reply("Стикер можно сохранить только для AI-цитаты. Ответьте на сообщение с цитатой бота.")
-        return
-
-    replied = message.reply_to_message
-    if not is_ai_quote_message(replied):
-        await message.reply("Стикер можно сохранить только для AI-цитаты. Ответьте на сообщение с цитатой бота.")
-        return
-
-    text = (replied.text or replied.caption or "").strip()
-    if not text:
-        await message.reply("Не удалось извлечь текст AI-цитаты из ответа.")
-        return
-
-    quote_key = get_quote_key(text)
-    quote_entry = quote_stats.get(quote_key) or ensure_quote_stats_entry(text)
-    source_user_id = quote_entry.get("source_user_id")
-    source_username = quote_entry.get("source_username")
-
-    try:
-        avatar_bytes = await get_user_avatar_bytes(int(source_user_id) if source_user_id is not None else None)
-        sticker_bytes = await create_sticker_bytes(
-            text,
-            user_photo=avatar_bytes,
-            username=source_username,
-        )
-        await bot.send_sticker(chat_id=message.chat.id, sticker=BufferedInputFile(sticker_bytes, filename="quote.webp"))
-    except Exception as exc:
-        print(f"Ошибка создания стикера: {exc}")
-        traceback.print_exc()
-        await message.reply("Не удалось создать стикер. Проверь, установлен ли Pillow.")
-
-
 @dp.message()
 async def handle_general_templates(message: Message):
     text = get_message_content(message).strip()
     has_media = any([message.photo, message.video, message.video_note, message.voice, message.audio, message.document])
+    if message.from_user and not message.from_user.is_bot and message.text and not message.text.startswith("/"):
+        save_message_to_history(message.chat.id, message.text)
     if not text and not has_media:
         return
 
