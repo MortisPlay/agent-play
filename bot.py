@@ -740,6 +740,34 @@ def add_style_emoji(text: str, style: str | None) -> str:
     return f"{cleaned} {emoji}"
 
 
+def sanitize_quote_text(text: str) -> str:
+    cleaned = re.sub(r"\s+", " ", (text or "").strip())
+    if not cleaned:
+        return ""
+
+    cleaned = cleaned.strip(" \"'“”‘’")
+    cleaned = re.sub(r"\b([А-Яа-яЁё]+)(?:\s+\1\b)+", r"\1", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+    cleaned = re.sub(r"([,;:]){2,}", r"\1", cleaned)
+
+    tokens = cleaned.split()
+    if tokens:
+        last_token = tokens[-1].strip(".,!?;:…")
+        trailing_words = {"и", "а", "но", "или", "да", "чтобы", "когда", "если", "ли", "же", "то", "тут", "вот", "ну", "мда", "бро", "чел"}
+        if last_token.lower() in trailing_words:
+            tokens = tokens[:-1]
+            cleaned = " ".join(tokens).strip()
+
+    cleaned = cleaned.strip(" ,.;:!?\"")
+    if not cleaned:
+        return ""
+
+    if not re.search(r"[.!?…]$", cleaned):
+        cleaned = f"{cleaned}."
+
+    return cleaned.strip()
+
+
 def build_quote_reply(text: str, style: str | None) -> str:
     text = text.strip()
     if not text:
@@ -942,6 +970,7 @@ async def generate_quote_reply(text: str, style: str | None = None, command_text
         "- Отвечай живо, по-русски и без английских слов.\n"
         "- Держи ответ коротким: 1–2 предложения максимум.\n"
         "- Создавай ответы по смыслу сообщения и по интонации, а не по шаблону.\n"
+        "- Не повторяй слова подряд и не обрывай мысль на полуслове — всегда заканчивай фразу нормально.\n"
         f"{context_block}\n" if context_block else ""
         f"Текст сообщения: {text}\n"
         "Верни только готовый ответ без объяснений и без кавычек."
@@ -966,7 +995,7 @@ async def generate_quote_reply(text: str, style: str | None = None, command_text
         content = getattr(getattr(choice, "message", {}), "content", None)
         reply_text = content.strip() if content else ""
         if reply_text:
-            cleaned = re.sub(r"\s+", " ", reply_text).strip()
+            cleaned = sanitize_quote_text(reply_text)
             if len(cleaned) > 2:
                 return add_style_emoji(cleaned, resolved_style)
         return build_quote_reply(text, resolved_style)
