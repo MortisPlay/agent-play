@@ -54,6 +54,8 @@ chat_settings: dict[str, dict[str, Any]] = {}
 pending_suggestions: dict[int, int] = {}
 pending_admin_comments: dict[int, str] = {}
 suggestion_anonymity: dict[int, bool] = {}
+pending_questions: dict[int, int] = {}
+question_reply_targets: dict[tuple[int, int], dict[str, Any]] = {}
 
 WELCOME_TEXT = (
     "Привет! Я — бот-агент. Упомяни меня в сообщении и задай вопрос,\n"
@@ -68,6 +70,16 @@ HELP_TEXT = (
     "• Ответь на сообщение командой /q — я сделаю из него цитату.\n"
     "• Используй /top, чтобы посмотреть самые оценённые цитаты.\n"
     "• Нажми кнопку ниже, если хочешь отправить предложку."
+)
+
+AGENT_UPDATES_TEXT = (
+    "🆕 Что уже добавили в агента:\n\n"
+    "• ИИ-ответы по упоминанию бота\n"
+    "• Кнопка «Есть вопрос!🤓» для быстрых вопросов\n"
+    "• Шаблоны ответов в личных сообщениях\n"
+    "• Улучшенные AI-цитаты и автоответы\n"
+    "• Кнопка обновлений для быстрого просмотра новинок\n\n"
+    "Скоро будет ещё больше фишек — следи за обновлениями!"
 )
 
 # Инициализация бота и клиента ИИ
@@ -197,6 +209,8 @@ def build_welcome_markup(chat_id: int | None = None) -> InlineKeyboardMarkup:
     buttons: list[list[InlineKeyboardButton]] = []
     if get_chat_setting(chat_id, 'app_button_enabled', True):
         buttons.append([InlineKeyboardButton(text="🚀 Открыть приложение", web_app=WebAppInfo(url="https://mortisplay.ru"))])
+    buttons.append([InlineKeyboardButton(text="❓ Есть вопрос!🤓", callback_data="question_open")])
+    buttons.append([InlineKeyboardButton(text="🆕 Обновление агента👀", callback_data="agent_updates_open")])
     if get_chat_setting(chat_id, 'suggestion_button_enabled', True):
         buttons.append([InlineKeyboardButton(text="💡 Кинуть предложку", callback_data="suggestion_open")])
     if not buttons:
@@ -316,6 +330,50 @@ async def send_suggestion_to_admin(message: Message, chat_id: int, suggestion_id
     except Exception as exc:
         print(f"Ошибка отправки предложки админам: {exc}")
         traceback.print_exc()
+
+
+async def send_question_to_admin(message: Message, chat_id: int, question_id: str) -> None:
+    user = getattr(message, "from_user", None)
+    full_name_parts = [
+        part for part in [getattr(user, "first_name", None), getattr(user, "last_name", None)] if part
+    ]
+    full_name = " ".join(full_name_parts) if full_name_parts else "Пользователь"
+    username = getattr(user, "username", None)
+    user_id = getattr(user, "id", None)
+
+    lines: list[str] = ["❓ Новый вопрос"]
+    if user_id is not None:
+        line = f"От: {full_name}"
+        if username:
+            line += f" (@{username})"
+        line += f"\nID: {user_id}"
+        lines.append(line)
+
+    caption_text = get_suggestion_content(message)
+    if caption_text:
+        lines.append("")
+        lines.append(caption_text)
+
+    base_text = "\n".join(lines).strip()
+    if not base_text:
+        base_text = "❓ Новый вопрос"
+
+    recipients = list(ADMIN_IDS) if ADMIN_IDS else [chat_id]
+    for recipient_id in recipients:
+        try:
+            sent_message = await bot.send_message(
+                chat_id=recipient_id,
+                text=f"{base_text}\n\nОтветьте на это сообщение, чтобы отправить ответ пользователю.",
+            )
+            if sent_message:
+                question_reply_targets[(int(recipient_id), int(sent_message.message_id))] = {
+                    "user_id": int(user_id) if user_id is not None else None,
+                    "chat_id": int(chat_id) if chat_id is not None else None,
+                    "question_id": question_id,
+                }
+        except Exception as exc:
+            print(f"Ошибка отправки вопроса админам: {exc}")
+            traceback.print_exc()
 
 
 def init_storage_db() -> None:
@@ -440,16 +498,21 @@ load_quote_stats()
 load_chat_settings()
 
 
-async def generate_ai_reply(prompt_text: str) -> str:
+async def generate_ai_reply(prompt_text: str, context_text: str | None = None) -> str:
     """Запрос к ИИ для общего ответа на вопрос (на русском)."""
+    system_prompt = (
+        "Ты — вежливый и полезный ассистент. Отвечай по-русски кратко и по существу, "
+        "если просят — можешь дать небольшой совет или шаги. Не добавляй лишних пояснений."
+    )
+    if context_text:
+        system_prompt = (
+            f"{system_prompt}\n\n"
+            "Ниже — дополнительный контекст о Mortisplay, его сайте и боте. "
+            "Если пользователь спрашивает про это, отвечай на его основе; если нет — игнорируй этот контекст.\n"
+            f"{context_text}"
+        )
     messages = [
-        {
-            "role": "system",
-            "content": (
-                "Ты — вежливый и полезный ассистент. Отвечай по-русски кратко и по существу, "
-                "если просят — можешь дать небольшой совет или шаги. Не добавляй лишних пояснений."
-            ),
-        },
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": prompt_text},
     ]
 
@@ -1004,6 +1067,29 @@ async def handle_admin_callbacks(callback: CallbackQuery):
             pass
 
 
+@dp.callback_query(lambda callback: callback.data == "question_open")
+async def handle_question_open(callback: CallbackQuery):
+    if not callback.from_user:
+        await callback.answer("Не удалось начать вопрос.")
+        return
+
+    pending_questions[callback.from_user.id] = callback.message.chat.id if callback.message else 0
+    await callback.answer("Отправьте ваш вопрос.")
+    try:
+        await callback.message.answer("Напишите ваш вопрос — я передам его администратору.")
+    except Exception:
+        pass
+
+
+@dp.callback_query(lambda callback: callback.data == "agent_updates_open")
+async def handle_agent_updates(callback: CallbackQuery):
+    await callback.answer("Смотрите, что новенького в агенте")
+    try:
+        await callback.message.answer(AGENT_UPDATES_TEXT)
+    except Exception:
+        pass
+
+
 @dp.callback_query(lambda callback: callback.data and callback.data.startswith("suggestion_"))
 async def handle_suggestion_callbacks(callback: CallbackQuery):
     data = callback.data or ""
@@ -1253,6 +1339,60 @@ async def handle_top_quotes(message: Message):
     await message.reply("Топ 5 оценённых цитат:\n" + "\n\n".join(lines), parse_mode="HTML")
 
 
+def is_private_chat(message: Message) -> bool:
+    chat = getattr(message, "chat", None)
+    if chat is None:
+        return False
+    chat_type = getattr(chat, "type", None)
+    if chat_type == "private":
+        return True
+    chat_id = getattr(chat, "id", None)
+    return bool(chat_id and int(chat_id) > 0)
+
+
+def get_private_chat_template(text: str) -> str | None:
+    normalized = re.sub(r"\s+", " ", (text or "").strip().lower())
+    if not normalized:
+        return None
+
+    if any(phrase in normalized for phrase in ["кто такой mortisplay", "расскажи про mortisplay", "про ютуб", "кто такой ютубер", "кто такой mortis"]):
+        return (
+            "Mortisplay — это ютубер, который занимается записью видеоигр, выкладывает угары, баги и эпики, а также снимает ролики вместе с друзьями, особенно rol1j, Johnny_Drill и другими. "
+            "Он уже больше 5 лет пытается добиться успеха, но мир не даёт ему покоя, чтобы он достиг своих 1К подписчиков и в какой-то момент нашёл свою славу. "
+            "За кулисами он также снимает разные видеоролики, гайды, подкасты и анимации — раньше больше этим занимался, сейчас уже не так часто. "
+            "У него есть 3 канала: Mortisplay32 (основной), Mortisplay_Studio (дополнительный) и F.U.J.I.N.mk56 (старый и заброшенный контент по SO2). "
+            "Если тебе было интересно послушать про разработчика этого агента, то приходи на его Telegram-канал: https://t.me/MortisPlayTG\n\n"
+            "Спасибо за внимание ❤️"
+        )
+
+    if any(phrase in normalized for phrase in ["что за сайт mortisplay.ru", "что за сайт", "про сайт", "про mortisplay.ru", "сайт mortisplay"]):
+        return (
+            "mortisplay.ru — это новый высокий уровень в карьере Mortis'a, где есть много развлекательного контента с ютуба и много крутых кнопочек. "
+            "В основном Mortis создавал его для своей аудитории, но пользовались им не так часто, потому что тогда у него была ещё маленькая аудитория. "
+            "Но уже сайту исполнился 1 год, и он стал частью семейной карьеры Mortis'a ❤️ "
+            "На сайте есть разделы Видео, Twitch и другие разделы. Всё остальное можно посмотреть прямо на сайте mortisplay.ru.\n\n"
+            "Спасибо за внимание ❤️"
+        )
+
+    if any(phrase in normalized for phrase in ["что за агент", "зачем создан агент", "для чего бот", "что это за агент", "что за бот"]):
+        return (
+            "Привет! Спасибо, что задал такой вопрос, но всё это лучше расскажет разработчик, потому что он в этом понимает больше: "
+            "По сути, это обычный бот, но мы решили сделать его в агента, потому что он оснащён хорошим искусственным интеллектом. "
+            "Через него можно делать ИИ-цитаты в группах, а также смотреть наш сайт прямо в Telegram через бота-агента. "
+            "Он ещё может иногда работать неидеально, потому что это первый стабильный бот в Telegram, который разработчик когда-либо делал. "
+            "В основном его делали для ИИ-цитат в чате, но в итоге он может стать самым развитым ботом-агентом."
+        )
+
+    if any(phrase in normalized for phrase in ["зачем он придумал ник mortis", "почему ник mortis", "почему mortis", "зачем придумал ник"]):
+        return (
+            "Хо хо хо, хороший вопрос, на котором сам Mortis затрудняется ответить. "
+            "Но всё очень просто: он просто придумал этот ник в голове, сплагиатил его из собственного вдохновения и так появился на свет. "
+            "При этом он ничего не украл, ни у Бравла, ни у кого-то другого."
+        )
+
+    return None
+
+
 @dp.message()
 async def handle_general_templates(message: Message):
     text = get_message_content(message).strip()
@@ -1281,6 +1421,30 @@ async def handle_general_templates(message: Message):
         await message.reply("Предложка отправлена админам.")
         return
 
+    if message.from_user and message.from_user.id in pending_questions:
+        pending_questions.pop(message.from_user.id, None)
+        question_id = hashlib.sha256(f"{message.from_user.id}:{time.time()}".encode("utf-8")).hexdigest()[:10]
+        await send_question_to_admin(message, message.chat.id, question_id)
+        await message.reply("Вопрос отправлен администратору.")
+        return
+
+    if message.from_user and is_admin_user(message.from_user) and message.reply_to_message:
+        reply_target = question_reply_targets.get((message.chat.id, message.reply_to_message.message_id))
+        if reply_target is not None:
+            reply_text = get_message_content(message).strip()
+            if reply_text:
+                user_id = reply_target.get("user_id")
+                try:
+                    if user_id is not None:
+                        await bot.send_message(chat_id=int(user_id), text=f"💬 Ответ от админа:\n\n{reply_text}")
+                    else:
+                        await message.reply("Не удалось определить пользователя для ответа.")
+                except Exception:
+                    pass
+            question_reply_targets.pop((message.chat.id, message.reply_to_message.message_id), None)
+            await message.reply("Ответ отправлен пользователю.")
+            return
+
     if message.from_user and message.from_user.id in pending_admin_comments:
         suggestion_id = pending_admin_comments.pop(message.from_user.id)
         entry = suggestion_requests.get(suggestion_id)
@@ -1292,6 +1456,12 @@ async def handle_general_templates(message: Message):
                 pass
             await message.reply("Комментарий отправлен пользователю.")
         return
+
+    if is_private_chat(message):
+        template = get_private_chat_template(text)
+        if template:
+            await message.reply(template)
+            return
 
     global BOT_USERNAME
     if not BOT_USERNAME:
@@ -1307,13 +1477,14 @@ async def handle_general_templates(message: Message):
             await message.reply("Да? Чем помочь? Напишите вопрос после упоминания бота.")
             return
 
+        context_text = get_private_chat_template(clean_text)
         try:
             await bot.send_chat_action(chat_id=message.chat.id, action="typing")
         except Exception as exc:
             print(f"Ошибка отправки typing action: {exc}")
         status = await message.reply("🤖 Думаю...")
         try:
-            ai_resp = await generate_ai_reply(clean_text)
+            ai_resp = await generate_ai_reply(clean_text, context_text=context_text)
             try:
                 await status.edit_text(ai_resp)
             except Exception:
