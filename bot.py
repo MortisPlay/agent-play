@@ -922,8 +922,12 @@ def format_quote_source(entry: dict[str, Any], bot_username: str | None = None) 
         return f"<code>Личное сообщение №{message_id}</code>"
 
     if chat_id < 0:
-        url = f"https://t.me/c/{abs(chat_id)}/{message_id}"
-        label = f"Чат #{abs(chat_id)} · сообщение #{message_id}"
+        # Telegram uses t.me/c/<chat_id_without_100_prefix>/<message_id> links for supergroup messages.
+        raw = str(abs(chat_id))
+        # If the internal id starts with '100' (supergroup full id), strip that prefix.
+        clean = raw[3:] if raw.startswith("100") else raw
+        url = f"https://t.me/c/{clean}/{message_id}"
+        label = f"Чат #{clean} · сообщение #{message_id}"
         return f'<a href="{html.escape(url, quote=True)}">{html.escape(label)}</a>'
 
     return f"<code>Источник №{message_id}</code>"
@@ -959,6 +963,8 @@ async def generate_quote_reply(text: str, style: str | None = None, command_text
         "roast": "Ты — мастер жесткого роаста и подколов. Твоя задача — едко высмеять сообщение пользователя, найти в нем уязвимость или глупость и разнести фактами с жестким юмором.",
         "toxic": "Ты — душный, саркастичный и максимально зубастый критик. Твои ответы режут как нож, наполнены чистым сарказмом и иронией.",
     }.get(resolved_style, "Ты — талантливый автор саркастичных и стильных reply-ответов в Telegram.")
+    # Жёсткое требование: никогда не обрывай слова или предложения — дописывай окончания и завершай мысль полностью.
+    system_prompt = f"{system_prompt} Никогда не обрывай слова или предложения; всегда завершай мысль полностью и дописывай окончания слов." 
     context_block = get_recent_chat_context(chat_id, limit=8) if chat_id is not None else ""
     prompt = (
         "Ты — автор очень живых, умных и остроумных reply-цитат для Telegram. "
@@ -971,6 +977,7 @@ async def generate_quote_reply(text: str, style: str | None = None, command_text
         "- Держи ответ коротким: 1–2 предложения максимум.\n"
         "- Создавай ответы по смыслу сообщения и по интонации, а не по шаблону.\n"
         "- Не повторяй слова подряд и не обрывай мысль на полуслове — всегда заканчивай фразу нормально.\n"
+        "- Никогда не обрывай слова или предложения — всегда дочитывай и дописывай окончания слов, чтобы фразы были полными.\n"
         f"{context_block}\n" if context_block else ""
         f"Текст сообщения: {text}\n"
         "Верни только готовый ответ без объяснений и без кавычек."
@@ -983,7 +990,7 @@ async def generate_quote_reply(text: str, style: str | None = None, command_text
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=45,
+            max_tokens=90,
             temperature=0.9,
             top_p=0.94,
             presence_penalty=0.2,
@@ -1543,7 +1550,7 @@ async def handle_general_templates(message: Message):
 
     reply_to_ai_quote = bool(message.reply_to_message and is_ai_quote_message(message.reply_to_message))
     should_generate_quote = reply_to_ai_quote or (
-        get_chat_setting(message.chat.id, 'auto_quote_enabled', True) and random.random() < 0.08
+        get_chat_setting(message.chat.id, 'auto_quote_enabled', True) and random.random() < 0.03
     )
     if should_generate_quote:
         try:
