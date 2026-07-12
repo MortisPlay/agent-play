@@ -55,7 +55,10 @@ pending_suggestions: dict[int, int] = {}
 pending_admin_comments: dict[int, str] = {}
 suggestion_anonymity: dict[int, bool] = {}
 pending_questions: dict[int, int] = {}
+pending_bug_reports: dict[int, int] = {}
+pending_bug_report_clarifications: dict[int, str] = {}
 question_reply_targets: dict[tuple[int, int], dict[str, Any]] = {}
+bug_report_requests: dict[str, dict[str, Any]] = {}
 
 WELCOME_TEXT = (
     "Привет! Я — бот-агент. Упомяни меня в сообщении и задай вопрос,\n"
@@ -70,16 +73,6 @@ HELP_TEXT = (
     "• Ответь на сообщение командой /q — я сделаю из него цитату.\n"
     "• Используй /top, чтобы посмотреть самые оценённые цитаты.\n"
     "• Нажми кнопку ниже, если хочешь отправить предложку."
-)
-
-AGENT_UPDATES_TEXT = (
-    "🆕 Что уже добавили в агента:\n\n"
-    "• ИИ-ответы по упоминанию бота\n"
-    "• Кнопка «Есть вопрос!🤓» для быстрых вопросов\n"
-    "• Шаблоны ответов в личных сообщениях\n"
-    "• Улучшенные AI-цитаты и автоответы\n"
-    "• Кнопка обновлений для быстрого просмотра новинок\n\n"
-    "Скоро будет ещё больше фишек — следи за обновлениями!"
 )
 
 # Инициализация бота и клиента ИИ
@@ -205,17 +198,71 @@ def build_admin_markup(chat_id: int) -> InlineKeyboardMarkup:
     )
 
 
-def build_welcome_markup(chat_id: int | None = None) -> InlineKeyboardMarkup:
+def build_welcome_markup(chat_id: int | None = None, *, include_private_only: bool = False) -> InlineKeyboardMarkup:
     buttons: list[list[InlineKeyboardButton]] = []
     if get_chat_setting(chat_id, 'app_button_enabled', True):
         buttons.append([InlineKeyboardButton(text="🚀 Открыть приложение", web_app=WebAppInfo(url="https://mortisplay.ru"))])
+    if include_private_only:
+        buttons.append([InlineKeyboardButton(text="👾 Сообщить об ошибке", callback_data="bug_report_open")])
+        buttons.append([InlineKeyboardButton(text="💫 Купить Звёзды", callback_data="stars_open")])
     buttons.append([InlineKeyboardButton(text="❓ Есть вопрос!🤓", callback_data="question_open")])
-    buttons.append([InlineKeyboardButton(text="🆕 Обновление агента👀", callback_data="agent_updates_open")])
     if get_chat_setting(chat_id, 'suggestion_button_enabled', True):
         buttons.append([InlineKeyboardButton(text="💡 Кинуть предложку", callback_data="suggestion_open")])
     if not buttons:
         return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🚀 Открыть приложение", web_app=WebAppInfo(url="https://mortisplay.ru"))]])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def send_bug_report_to_admin(message: Message, chat_id: int, report_id: str) -> None:
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Принять", callback_data=f"bug_report_accept:{report_id}"),
+                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"bug_report_decline:{report_id}"),
+            ],
+            [InlineKeyboardButton(text="💬 Уточнить", callback_data=f"bug_report_clarify:{report_id}")],
+        ]
+    )
+
+    user = getattr(message, "from_user", None)
+    full_name_parts = [part for part in [getattr(user, "first_name", None), getattr(user, "last_name", None)] if part]
+    full_name = " ".join(full_name_parts) if full_name_parts else "Пользователь"
+    username = getattr(user, "username", None)
+    user_id = getattr(user, "id", None)
+
+    lines: list[str] = ["👾 Новый отчёт об ошибке"]
+    if user_id is not None:
+        line = f"От: {full_name}"
+        if username:
+            line += f" (@{username})"
+        line += f"\nID: {user_id}"
+        lines.append(line)
+
+    caption_text = get_suggestion_content(message)
+    if caption_text:
+        lines.append("")
+        lines.append(caption_text)
+
+    base_text = "\n".join(lines).strip()
+    if not base_text:
+        base_text = "👾 Новый отчёт об ошибке"
+
+    try:
+        if message.photo:
+            await bot.send_photo(chat_id=chat_id, photo=message.photo[-1].file_id, caption=base_text, reply_markup=markup)
+        elif message.video:
+            await bot.send_video(chat_id=chat_id, video=message.video.file_id, caption=base_text, reply_markup=markup)
+        elif message.voice:
+            await bot.send_voice(chat_id=chat_id, voice=message.voice.file_id, caption=base_text, reply_markup=markup)
+        elif message.audio:
+            await bot.send_audio(chat_id=chat_id, audio=message.audio.file_id, caption=base_text, reply_markup=markup)
+        elif message.document:
+            await bot.send_document(chat_id=chat_id, document=message.document.file_id, caption=base_text, reply_markup=markup)
+        else:
+            await bot.send_message(chat_id=chat_id, text=base_text, reply_markup=markup)
+    except Exception as exc:
+        print(f"Ошибка отправки отчёта об ошибке админам: {exc}")
+        traceback.print_exc()
 
 
 def get_suggestion_content(message: Message) -> str:
@@ -1117,13 +1164,81 @@ async def handle_question_open(callback: CallbackQuery):
         pass
 
 
-@dp.callback_query(lambda callback: callback.data == "agent_updates_open")
-async def handle_agent_updates(callback: CallbackQuery):
-    await callback.answer("Смотрите, что новенького в агенте")
+@dp.callback_query(lambda callback: callback.data == "bug_report_open")
+async def handle_bug_report_open(callback: CallbackQuery):
+    if not callback.from_user:
+        await callback.answer("Не удалось начать отправку отчёта.")
+        return
+
+    pending_bug_reports[callback.from_user.id] = callback.message.chat.id if callback.message else 0
+    await callback.answer("Отправьте скриншот и кратко опишите баг.")
     try:
-        await callback.message.answer(AGENT_UPDATES_TEXT)
+        await callback.message.answer(
+            "📸 Пришлите скриншот и кратко напишите, что за ошибка или баг вы нашли."
+            " После этого мы рассмотрим ваш отчёт."
+        )
     except Exception:
         pass
+
+
+@dp.callback_query(lambda callback: callback.data == "stars_open")
+async def handle_stars_open(callback: CallbackQuery):
+    await callback.answer("Пока что в разработке")
+    try:
+        await callback.message.answer("💫 Покупка звёзд пока что в разработке. Скоро добавим это здесь.")
+    except Exception:
+        pass
+
+
+@dp.callback_query(lambda callback: callback.data and callback.data.startswith("bug_report_"))
+async def handle_bug_report_callbacks(callback: CallbackQuery):
+    data = callback.data or ""
+    if data.startswith("bug_report_accept:"):
+        report_id = data.split(":", 1)[1]
+        entry = bug_report_requests.get(report_id)
+        if entry:
+            await callback.answer("Отчёт принят.")
+            try:
+                await callback.message.edit_text(f"✅ Принято\n\n{entry.get('text', '')}", reply_markup=None)
+            except Exception:
+                pass
+            if entry.get("user_id"):
+                try:
+                    await bot.send_message(
+                        chat_id=int(entry["user_id"]),
+                        text="✅ Ваше уведомление об ошибке принято. Администратор взялся за работу.",
+                    )
+                except Exception:
+                    pass
+        return
+
+    if data.startswith("bug_report_decline:"):
+        report_id = data.split(":", 1)[1]
+        entry = bug_report_requests.get(report_id)
+        if entry:
+            await callback.answer("Отчёт отклонён.")
+            try:
+                await callback.message.edit_text(f"❌ Отклонено\n\n{entry.get('text', '')}", reply_markup=None)
+            except Exception:
+                pass
+            if entry.get("user_id"):
+                try:
+                    await bot.send_message(
+                        chat_id=int(entry["user_id"]),
+                        text="❌ Ваше уведомление об ошибке отклонено. Спасибо, что помогаете улучшать проект.",
+                    )
+                except Exception:
+                    pass
+        return
+
+    if data.startswith("bug_report_clarify:"):
+        report_id = data.split(":", 1)[1]
+        pending_bug_report_clarifications[callback.from_user.id] = report_id
+        await callback.answer("Напишите уточнение пользователю.")
+        try:
+            await callback.message.answer("💬 Напишите уточнение для пользователя, которое нужно отправить ему в ответ.")
+        except Exception:
+            pass
 
 
 @dp.callback_query(lambda callback: callback.data and callback.data.startswith("suggestion_"))
@@ -1266,12 +1381,18 @@ async def handle_admin_panel(message: Message):
 async def handle_start(message: Message):
     if not get_chat_setting(message.chat.id, 'welcome_enabled', True):
         return
-    await message.answer(WELCOME_TEXT, reply_markup=build_welcome_markup(message.chat.id))
+    await message.answer(
+        WELCOME_TEXT,
+        reply_markup=build_welcome_markup(message.chat.id, include_private_only=is_private_chat(message)),
+    )
 
 
 @dp.message(Command(commands=["help"], ignore_case=True))
 async def handle_help(message: Message):
-    await message.answer(HELP_TEXT, reply_markup=build_welcome_markup(message.chat.id))
+    await message.answer(
+        HELP_TEXT,
+        reply_markup=build_welcome_markup(message.chat.id, include_private_only=is_private_chat(message)),
+    )
 
 
 @dp.message(Command(commands=["q"], ignore_case=True))
@@ -1462,6 +1583,41 @@ async def handle_general_templates(message: Message):
         question_id = hashlib.sha256(f"{message.from_user.id}:{time.time()}".encode("utf-8")).hexdigest()[:10]
         await send_question_to_admin(message, message.chat.id, question_id)
         await message.reply("Вопрос отправлен администратору.")
+        return
+
+    if message.from_user and message.from_user.id in pending_bug_reports:
+        pending_bug_reports.pop(message.from_user.id, None)
+        report_id = hashlib.sha256(f"{message.from_user.id}:{time.time()}".encode("utf-8")).hexdigest()[:10]
+        bug_report_requests[report_id] = {
+            "text": get_suggestion_content(message),
+            "user_id": message.from_user.id,
+            "chat_id": message.chat.id,
+        }
+        if not message.photo and not message.video and not message.voice and not message.audio and not message.document and not get_suggestion_content(message):
+            await message.reply("📸 Пришлите скриншот и кратко опишите баг, чтобы отправить отчёт.")
+            return
+        await send_bug_report_to_admin(message, message.chat.id, report_id)
+        await message.reply(
+            "Спасибо, что помогаете развивать сообщество и находите ошибки."
+            " Мы передали ваш отчёт администратору."
+        )
+        return
+
+    if message.from_user and message.from_user.id in pending_bug_report_clarifications:
+        clarification_text = get_message_content(message).strip()
+        report_id = pending_bug_report_clarifications.pop(message.from_user.id)
+        entry = bug_report_requests.get(report_id)
+        if entry and entry.get("user_id"):
+            try:
+                await bot.send_message(
+                    chat_id=int(entry["user_id"]),
+                    text=f"💬 Уточнение от администратора:\n\n{clarification_text or 'Без текста'}",
+                )
+            except Exception:
+                pass
+            await message.reply("Уточнение отправлено пользователю.")
+        else:
+            await message.reply("Не удалось отправить уточнение.")
         return
 
     if message.from_user and is_admin_user(message.from_user) and message.reply_to_message:
