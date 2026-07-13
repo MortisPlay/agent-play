@@ -1,7 +1,10 @@
+import asyncio
 import hashlib
 import html
 import random
 import re
+import time
+import traceback
 
 from aiogram.filters import Command
 from aiogram.types import Message
@@ -17,7 +20,9 @@ from ai_utils import (
 import bot_config
 from bot_config import (
     ADMIN_IDS,
+    BOT_USERNAME,
     bot,
+    bug_report_requests,
     dp,
     pending_admin_comments,
     pending_bug_report_clarifications,
@@ -28,6 +33,7 @@ from bot_config import (
     suggestion_anonymity,
     suggestion_requests,
     quote_stats,
+    increment_stat,
 )
 from helpers import (
     get_chat_setting,
@@ -55,6 +61,48 @@ from storage import load_chat_settings, load_quote_stats, save_message_to_histor
 
 load_quote_stats()
 load_chat_settings()
+
+
+THINKING_STATUSES = [
+    "🤖 Думаю...",
+    "🤖 Анализирую...",
+    "🤖 Обрабатываю...",
+    "🤖 Ищу ответ...",
+    "🤖 Включаю мозги...",
+    "⏳ Сейчас...",
+    "⏳ Момент...",
+]
+
+
+async def animate_thinking_status(message: Message, status_msg, duration: float = 30.0):
+    """
+    Анимирует статусное сообщение с разными текстами пока проходит обработка.
+    duration — максимальное время обновления (сек)
+    """
+    if not status_msg:
+        return
+    
+    try:
+        start_time = asyncio.get_event_loop().time()
+        index = 0
+        last_text = ""
+        while asyncio.get_event_loop().time() - start_time < duration:
+            try:
+                text = THINKING_STATUSES[index % len(THINKING_STATUSES)]
+                # Только обновляем если текст действительно изменился
+                if text != last_text:
+                    await status_msg.edit_text(text)
+                    last_text = text
+                index += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # Игнорируем ошибки "message not modified"
+                if "not modified" not in str(e).lower():
+                    print(f"Ошибка обновления статуса: {e}")
+            await asyncio.sleep(0.8)
+    except asyncio.CancelledError:
+        pass
 
 
 @dp.message(Command(commands=["admin"], ignore_case=True))
@@ -91,6 +139,7 @@ async def handle_help(message: Message):
 
 @dp.message(Command(commands=["q"], ignore_case=True))
 async def handle_quote_command(message: Message):
+    increment_stat("commands_used")
     text = (message.text or "").strip()
     args = text.split()[1:] if text.startswith("/q") else []
 
@@ -159,6 +208,7 @@ async def handle_quote_command(message: Message):
 
 @dp.message(Command(commands=["topquotes", "top"], ignore_case=True))
 async def handle_top_quotes(message: Message):
+    increment_stat("commands_used")
     if is_private_chat(message):
         await message.reply("Команда /top доступна только в группах.")
         return
@@ -308,6 +358,7 @@ async def handle_general_templates(message: Message):
             BOT_USERNAME = None
 
     if get_chat_setting(message.chat.id, 'ai_enabled', True) and BOT_USERNAME and f"@{BOT_USERNAME.lower()}" in text.lower():
+        increment_stat("mentions")
         clean_text = re.sub(rf"@{re.escape(BOT_USERNAME)}", "", text, flags=re.I).strip()
         if not clean_text:
             await message.reply("Да? Чем помочь? Напишите вопрос после упоминания бота.")
@@ -319,18 +370,36 @@ async def handle_general_templates(message: Message):
         except Exception as exc:
             print(f"Ошибка отправки typing action: {exc}")
         status = await message.reply("🤖 Думаю...")
+        
+        # Запускаем анимацию статуса в фоне с небольшой задержкой
+        animation_task = asyncio.create_task(animate_thinking_status(message, status, duration=35.0))
+        
         try:
             ai_resp = await generate_ai_reply(clean_text, context_text=context_text)
+            # Отменяем анимацию и ждём завершения
+            animation_task.cancel()
+            try:
+                await animation_task
+            except asyncio.CancelledError:
+                pass
             try:
                 await status.edit_text(ai_resp)
-            except Exception:
+            except Exception as e:
+                print(f"Ошибка редактирования статуса: {e}")
                 await message.reply(ai_resp)
         except Exception as e:
             print(f"Ошибка при ответе ИИ на упоминание: {e}")
             traceback.print_exc()
+            # Отменяем анимацию
+            animation_task.cancel()
+            try:
+                await animation_task
+            except asyncio.CancelledError:
+                pass
             try:
                 await status.edit_text("Ошибка при получении ответа от ИИ.")
-            except Exception:
+            except Exception as e:
+                print(f"Ошибка редактирования ошибки: {e}")
                 await message.reply("Ошибка при получении ответа от ИИ.")
         return
 

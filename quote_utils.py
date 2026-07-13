@@ -8,7 +8,7 @@ from typing import Any
 from aiogram.types import Message
 
 import bot_config
-from bot_config import ai_client, bot, MODEL_CHAT, quote_stats
+from bot_config import ai_client, bot, MODEL_CHAT, quote_stats, increment_stat
 from helpers import get_chat_setting
 from storage import get_recent_chat_context, save_quote_stats
 from ai_utils import extract_text_source, is_openrouter_access_denied_error
@@ -400,6 +400,7 @@ async def generate_quote_reply(text: str, style: str | None = None, command_text
         if reply_text:
             cleaned = sanitize_quote_text(reply_text)
             if len(cleaned) > 2:
+                increment_stat("quote_created")
                 return add_style_emoji(cleaned, resolved_style)
         return build_quote_reply(text, resolved_style)
     except Exception as e:

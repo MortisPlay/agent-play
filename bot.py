@@ -8,7 +8,7 @@ import interactions  # noqa: F401
 
 
 async def main() -> None:
-    print("Бот запущен на OpenRouter с дизайном QuotLy! Погнали!")
+    print("Бот запущен. Ожидание сообщений...")
     storage.load_quote_stats()
     storage.load_chat_settings()
 

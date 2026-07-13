@@ -1,4 +1,5 @@
-aiogram
+﻿aiogram
 python-dotenv
 openai
 httpx
+pillow

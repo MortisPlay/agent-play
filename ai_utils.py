@@ -7,7 +7,7 @@ import traceback
 import httpx
 from aiogram.types import Message
 
-from bot_config import ai_client, bot, MODEL_CHAT, MODEL_VISION, MODEL_WHISPER, OPENAI_API_KEY
+from bot_config import ai_client, bot, MODEL_CHAT, MODEL_VISION, MODEL_WHISPER, OPENAI_API_KEY, increment_stat
 
 
 async def describe_photo_bytes(image_bytes: bytes) -> str:
@@ -177,7 +177,10 @@ async def generate_ai_reply(prompt_text: str, context_text: str | None = None) -
             return prompt_text.strip()
         choice = response.choices[0]
         content = getattr(getattr(choice, "message", {}), "content", None)
-        return content.strip() if content else prompt_text.strip()
+        if content:
+            increment_stat("ai_responses")
+            return content.strip()
+        return prompt_text.strip()
     except Exception as e:
         if is_openrouter_access_denied_error(e):
             print("Ошибка AI reply: доступ к OpenRouter запрещён политикой безопасности.")

@@ -48,6 +48,13 @@ pending_bug_report_clarifications: dict[int, str] = {}
 question_reply_targets: dict[tuple[int, int], dict[str, Any]] = {}
 bug_report_requests: dict[str, dict[str, Any]] = {}
 
+agent_stats: dict[str, int] = {
+    "ai_responses": 0,
+    "quote_created": 0,
+    "commands_used": 0,
+    "mentions": 0,
+}
+
 WELCOME_TEXT = (
     "Привет! Я — бот-агент. Упомяни меня в сообщении и задай вопрос,\n"
     "например: @agentplay_bot Как мне сделать X?\n\n"
@@ -119,3 +126,21 @@ ai_client = AsyncOpenAI(
 
 quote_stats: dict[str, dict[str, Any]] = {}
 suggestion_requests: dict[str, dict[str, Any]] = {}
+
+
+def increment_stat(key: str, value: int = 1) -> None:
+    """Увеличить счётчик в agent_stats."""
+    if key in agent_stats:
+        agent_stats[key] += value
+
+
+def get_agent_stats_text() -> str:
+    """Получить текст статистики агента для админ-панели."""
+    return (
+        "📊 Статистика агента:\n\n"
+        f"🤖 ИИ-ответов: {agent_stats.get('ai_responses', 0)}\n"
+        f"💬 Цитат создано: {agent_stats.get('quote_created', 0)}\n"
+        f"⌨️ Команд использовано: {agent_stats.get('commands_used', 0)}\n"
+        f"@️ Упоминаний: {agent_stats.get('mentions', 0)}"
+    )
+

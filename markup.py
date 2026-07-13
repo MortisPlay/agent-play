@@ -47,7 +47,6 @@ def build_welcome_markup(chat_id: int | None = None, *, include_private_only: bo
         buttons.append([InlineKeyboardButton(text="🚀 Открыть приложение", web_app=WebAppInfo(url="https://mortisplay.ru"))])
     if include_private_only:
         buttons.append([InlineKeyboardButton(text="👾 Сообщить об ошибке", callback_data="bug_report_open")])
-        buttons.append([InlineKeyboardButton(text="💫 Купить Звёзды", callback_data="stars_open")])
     buttons.append([InlineKeyboardButton(text="❓ Есть вопрос!🤓", callback_data="question_open")])
     if get_chat_setting(chat_id, 'suggestion_button_enabled', True):
         buttons.append([InlineKeyboardButton(text="💡 Кинуть предложку", callback_data="suggestion_open")])

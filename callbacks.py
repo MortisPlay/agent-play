@@ -18,6 +18,7 @@ from bot_config import (
     suggestion_anonymity,
     quote_stats,
     suggestion_requests,
+    get_agent_stats_text,
 )
 from helpers import get_chat_setting, get_suggestion_content, is_admin_user, set_chat_setting
 from markup import build_admin_markup
@@ -71,6 +72,14 @@ async def handle_admin_callbacks(callback: CallbackQuery):
                 f"• Приложение: {'вкл' if get_chat_setting(chat_id, 'app_button_enabled', True) else 'выкл'}",
                 reply_markup=build_admin_markup(chat_id or int(callback.message.chat.id)),
             )
+        except Exception:
+            pass
+
+    if data.startswith("admin_status:"):
+        await callback.answer("Загрузка статистики...")
+        try:
+            stats_text = get_agent_stats_text()
+            await callback.message.answer(stats_text)
         except Exception:
             pass
 
