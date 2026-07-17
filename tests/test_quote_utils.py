@@ -1,7 +1,7 @@
 import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import handlers
 from helpers import _build_kira_reply, is_meme_template_text
@@ -53,6 +53,58 @@ class QuoteStyleTests(unittest.TestCase):
         self.assertTrue(any(keyword in lag_reply.lower() for keyword in ["пинг", "лаг", "тимм", "катк"]))
         self.assertTrue(any(keyword in duel_reply.lower() for keyword in ["1 на 1", "дуэль", "pvp", "вызов"]))
         self.assertTrue(any(keyword in esports_reply.lower() for keyword in ["конкур", "стример", "кибер", "скилл", "вайб"]))
+
+    def test_handler_prefers_nick_template_for_mortis_nickname_question(self):
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=1, type="private"),
+            from_user=SimpleNamespace(id=2, is_bot=False),
+            text="Почему мортис придумал такой ник?",
+            caption=None,
+            photo=None,
+            video=None,
+            video_note=None,
+            voice=None,
+            audio=None,
+            document=None,
+            reply_to_message=None,
+            reply=AsyncMock(),
+        )
+
+        async def run_test():
+            with patch("handlers.save_message_to_history", Mock()):
+                await handlers.handle_general_templates(message)
+
+        asyncio.run(run_test())
+
+        reply_text = message.reply.await_args_list[0].args[0]
+        self.assertIn("Mortis", reply_text)
+        self.assertNotIn("Если ты говоришь про Мортиса", reply_text)
+
+    def test_handler_prefers_mortisplay_template_for_intro_questions(self):
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=1, type="private"),
+            from_user=SimpleNamespace(id=2, is_bot=False),
+            text="кто такой mortisplay?",
+            caption=None,
+            photo=None,
+            video=None,
+            video_note=None,
+            voice=None,
+            audio=None,
+            document=None,
+            reply_to_message=None,
+            reply=AsyncMock(),
+        )
+
+        async def run_test():
+            with patch("handlers.save_message_to_history", Mock()):
+                await handlers.handle_general_templates(message)
+
+        asyncio.run(run_test())
+
+        reply_text = message.reply.await_args_list[0].args[0]
+        self.assertIn("Mortisplay", reply_text)
+        self.assertNotIn("Если ты говоришь про Мортиса", reply_text)
 
     def test_reply_to_agent_message_accepts_explicit_arguments(self):
         message = SimpleNamespace(chat=SimpleNamespace(id=1), reply=AsyncMock())
