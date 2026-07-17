@@ -36,11 +36,15 @@ from bot_config import (
     increment_stat,
 )
 from helpers import (
+    _build_kira_reply,
     get_chat_setting,
     get_message_content,
     get_private_chat_template,
     get_suggestion_content,
     is_admin_user,
+    is_kira_related_text,
+    is_meme_template_text,
+    is_mortis_related_text,
     is_private_chat,
     is_video_update_request,
 )
@@ -53,6 +57,7 @@ from quote_utils import (
     generate_quote_reply,
     infer_quote_style,
     is_ai_quote_message,
+    parse_quote_command_args,
     select_relevant_messages,
     send_quote_with_feedback,
 )
@@ -148,16 +153,7 @@ async def handle_quote_command(message: Message):
         await message.reply("Ответь на сообщение, чтобы я сделал из него цитату.")
         return
 
-    count = 1
-    explicit_style = None
-
-    if args:
-        first_arg = args[0].strip()
-        if first_arg.isdigit():
-            count = max(1, int(first_arg))
-            explicit_style = args[1].strip() if len(args) > 1 else None
-        else:
-            explicit_style = first_arg
+    explicit_style = parse_quote_command_args(args)
 
     source_text = ""
     if replied.voice or replied.audio:
@@ -174,13 +170,13 @@ async def handle_quote_command(message: Message):
             if photo_bytes:
                 source_text = await describe_photo_bytes(photo_bytes)
     else:
-        source_texts = await collect_reply_context(replied, max_messages=max(count + 3, 3))
+        source_texts = await collect_reply_context(replied, max_messages=4)
         if not source_texts:
-            await message.reply("Не нашёл ни одного текстового сообщения для объединения.")
+            await message.reply("Не нашёл ни одного текстового сообщения для цитаты.")
             return
-        relevant_messages = select_relevant_messages(source_texts, max_items=max(count, 1))
+        relevant_messages = select_relevant_messages(source_texts, max_items=1)
         if not relevant_messages:
-            relevant_messages = source_texts[: max(count, 1)]
+            relevant_messages = source_texts[:1]
         source_text = "\n".join(relevant_messages)
 
     if not source_text.strip():
@@ -242,6 +238,78 @@ async def handle_top_quotes(message: Message):
         )
 
     await message.reply("Топ 5 оценённых цитат:\n" + "\n\n".join(lines), parse_mode="HTML")
+
+
+def _build_mortis_chat_reply(text: str) -> str:
+    normalized = re.sub(r"\s+", " ", (text or "").strip().lower())
+
+    if any(keyword in normalized for keyword in ["заблокир", "заблокировать", "блок", "ркн", "запрет"]):
+        return "Если бы РКН позволил заблокировать за такие вопросы, то с радостью бы начал с кого-то, точно не с Мортиса 😑"
+
+    if any(keyword in normalized for keyword in ["сосал", "сосать", "сосёт", "сосет", "сосёшь", "сосешь"]):
+        return "Откуда тебе это знать. Я — агент. А вот то, что ты сосёшь при каждой проигранной катке, вот это — да 👾"
+
+    if any(keyword in normalized for keyword in ["лох", "дебил", "тупой", "туп", "мразь", "мраз"]):
+        return "Тебе не дадут доказать, что кто-то в этом лагере лох. Думай сам."
+
+    if any(keyword in normalized for keyword in ["цитат", "придумай", "цитируй", "напиши"]):
+        return "Уже придумал. Вот он: Мортис — настоящий рыцарь и одновременно сигма, который копит ауру и потом доказывает всем, что он всегда прав. На том и держится настоящая машина для мозга 🤙"
+
+    if any(keyword in normalized for keyword in ["шут", "шутка", "смешно", "смешно?", "смешно)"]):
+        return "Если в шутку — то и я в шутку. Но если ты реально пытаешься зацепить человека, то я не дам себя провоцировать."
+
+    if any(keyword in normalized for keyword in ["серьёзно", "серьезно", "по фактам", "реально", "спокойно"]):
+        return "Если по фактам, то я защищаю разработчика спокойно и аргументированно, а не просто разгоняю эмоции."
+
+    return "Если ты говоришь про Мортиса, то я отвечу спокойно, по фактам и без лишнего хамства."
+
+
+async def _reply_to_agent_message(message: Message, clean_text: str, context_text: str | None = None) -> None:
+    try:
+        await bot.send_chat_action(chat_id=message.chat.id, action="typing")
+    except Exception as exc:
+        print(f"Ошибка отправки typing action: {exc}")
+
+    status = await message.reply("🤖 Думаю...")
+    animation_task = asyncio.create_task(animate_thinking_status(message, status, duration=35.0))
+
+    try:
+        ai_resp = await generate_ai_reply(clean_text, context_text=context_text)
+        animation_task.cancel()
+        try:
+            await animation_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await status.edit_text(ai_resp)
+        except Exception as e:
+            print(f"Ошибка редактирования статуса: {e}")
+            await message.reply(ai_resp)
+    except Exception as e:
+        print(f"Ошибка при ответе ИИ: {e}")
+        traceback.print_exc()
+        animation_task.cancel()
+        try:
+            await animation_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await status.edit_text("Ошибка при получении ответа от ИИ.")
+        except Exception as e:
+            print(f"Ошибка редактирования ошибки: {e}")
+            await message.reply("Ошибка при получении ответа от ИИ.")
+
+
+def _should_answer_without_mention(message: Message, text: str) -> bool:
+    if not is_private_chat(message):
+        return False
+
+    lowered = (text or "").strip().lower()
+    if not lowered:
+        return False
+
+    mortis_keywords = ["мортис", "mortis", "mortisplay", "мортиса", "мортиса"]
+    return any(keyword in lowered for keyword in mortis_keywords)
 
 
 @dp.message()
@@ -343,10 +411,29 @@ async def handle_general_templates(message: Message):
             await message.reply("Комментарий отправлен пользователю.")
         return
 
+    if is_meme_template_text(text):
+        template = get_private_chat_template(text)
+        if template:
+            await message.reply(template)
+            return
+
+    if is_mortis_related_text(text):
+        await message.reply(_build_mortis_chat_reply(text))
+        return
+
+    if is_kira_related_text(text):
+        await message.reply(_build_kira_reply(text))
+        return
+
     if is_private_chat(message):
         template = get_private_chat_template(text)
         if template:
             await message.reply(template)
+            return
+
+        if _should_answer_without_mention(message, text):
+            context_text = get_private_chat_template(text)
+            await _reply_to_agent_message(message, clean_text=text, context_text=context_text)
             return
 
     global BOT_USERNAME
@@ -357,50 +444,21 @@ async def handle_general_templates(message: Message):
         except Exception:
             BOT_USERNAME = None
 
-    if get_chat_setting(message.chat.id, 'ai_enabled', True) and BOT_USERNAME and f"@{BOT_USERNAME.lower()}" in text.lower():
-        increment_stat("mentions")
-        clean_text = re.sub(rf"@{re.escape(BOT_USERNAME)}", "", text, flags=re.I).strip()
+    if get_chat_setting(message.chat.id, 'ai_enabled', True) and (
+        (BOT_USERNAME and f"@{BOT_USERNAME.lower()}" in text.lower()) or _should_answer_without_mention(message, text)
+    ):
+        if BOT_USERNAME and f"@{BOT_USERNAME.lower()}" in text.lower():
+            increment_stat("mentions")
+            clean_text = re.sub(rf"@{re.escape(BOT_USERNAME)}", "", text, flags=re.I).strip()
+        else:
+            clean_text = text.strip()
+
         if not clean_text:
             await message.reply("Да? Чем помочь? Напишите вопрос после упоминания бота.")
             return
 
         context_text = get_private_chat_template(clean_text)
-        try:
-            await bot.send_chat_action(chat_id=message.chat.id, action="typing")
-        except Exception as exc:
-            print(f"Ошибка отправки typing action: {exc}")
-        status = await message.reply("🤖 Думаю...")
-        
-        # Запускаем анимацию статуса в фоне с небольшой задержкой
-        animation_task = asyncio.create_task(animate_thinking_status(message, status, duration=35.0))
-        
-        try:
-            ai_resp = await generate_ai_reply(clean_text, context_text=context_text)
-            # Отменяем анимацию и ждём завершения
-            animation_task.cancel()
-            try:
-                await animation_task
-            except asyncio.CancelledError:
-                pass
-            try:
-                await status.edit_text(ai_resp)
-            except Exception as e:
-                print(f"Ошибка редактирования статуса: {e}")
-                await message.reply(ai_resp)
-        except Exception as e:
-            print(f"Ошибка при ответе ИИ на упоминание: {e}")
-            traceback.print_exc()
-            # Отменяем анимацию
-            animation_task.cancel()
-            try:
-                await animation_task
-            except asyncio.CancelledError:
-                pass
-            try:
-                await status.edit_text("Ошибка при получении ответа от ИИ.")
-            except Exception as e:
-                print(f"Ошибка редактирования ошибки: {e}")
-                await message.reply("Ошибка при получении ответа от ИИ.")
+        await _reply_to_agent_message(message, clean_text=clean_text, context_text=context_text)
         return
 
     if is_video_update_request(text):

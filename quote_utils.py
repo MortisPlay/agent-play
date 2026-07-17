@@ -68,6 +68,23 @@ def infer_quote_style(source_text: str, command_text: str = "") -> str:
     return random.choice(["genz", "roast", "toxic"])
 
 
+def parse_quote_command_args(args: list[str] | None) -> str | None:
+    if not args:
+        return None
+
+    first_arg = args[0].strip()
+    if not first_arg:
+        return None
+
+    if first_arg.isdigit():
+        if len(args) > 1:
+            second_arg = args[1].strip()
+            return second_arg or None
+        return None
+
+    return first_arg
+
+
 def select_relevant_messages(messages: list[str], max_items: int = 1) -> list[str]:
     if not messages:
         return []

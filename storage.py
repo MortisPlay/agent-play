@@ -8,6 +8,7 @@ from bot_config import DB_PATH, CHAT_SETTINGS_PATH, STATS_PATH, chat_settings, q
 
 
 def init_storage_db() -> None:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(DB_PATH) as connection:
         connection.execute("CREATE TABLE IF NOT EXISTS quote_stats (key TEXT PRIMARY KEY, payload TEXT NOT NULL)")
         connection.execute("CREATE TABLE IF NOT EXISTS chat_settings (chat_id TEXT PRIMARY KEY, payload TEXT NOT NULL)")

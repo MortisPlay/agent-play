@@ -146,18 +146,35 @@ async def transcribe_audio_bytes(audio_bytes: bytes, audio_format: str = "ogg") 
         return ""
 
 
-async def generate_ai_reply(prompt_text: str, context_text: str | None = None) -> str:
-    system_prompt = (
-        "Ты — вежливый и полезный ассистент. Отвечай по-русски кратко и по существу, "
-        "если просят — можешь дать небольшой совет или шаги. Не добавляй лишних пояснений."
+def build_agent_persona_prompt(prompt_text: str, context_text: str | None = None) -> str:
+    lowered = (prompt_text or "").lower()
+    has_mortis_context = any(term in lowered for term in ["мортис", "mortis", "мортиса", "mortisplay"])
+
+    base_prompt = (
+        "Ты — дружелюбный агент для Telegram. Отвечай по-русски, кратко и по существу. "
+        "Если пользователь шутит — отвечай в шутку, если серьёзно — отвечай серьёзно. "
+        "Не переходи в хамство и не разжигай конфликт. "
+        "Если кто-то задевает разработчика или его работу, защищай спокойно, по фактам и с умными словами."
     )
+
+    if has_mortis_context:
+        base_prompt += (
+            " Если речь о Мортисе или Mortis, отвечай так, будто ты его защитник: "
+            "сохраняй уважительный тон, опирайся на факты, а не на личные выпады, и при необходимости упоминай его по имени."
+        )
+
     if context_text:
-        system_prompt = (
-            f"{system_prompt}\n\n"
+        base_prompt = (
+            f"{base_prompt}\n\n"
             "Ниже — дополнительный контекст о Mortisplay, его сайте и боте. "
             "Если пользователь спрашивает про это, отвечай на его основе; если нет — игнорируй этот контекст.\n"
             f"{context_text}"
         )
+    return base_prompt
+
+
+async def generate_ai_reply(prompt_text: str, context_text: str | None = None) -> str:
+    system_prompt = build_agent_persona_prompt(prompt_text, context_text)
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": prompt_text},
