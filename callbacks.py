@@ -270,7 +270,7 @@ async def handle_quote_feedback(callback: CallbackQuery):
         return
 
     entry = quote_stats.get(quote_key)
-    if entry is None:
+    if entry is None or not isinstance(entry, dict):
         entry = {"text": "", "likes": 0, "dislikes": 0, "voters": {}}
         quote_stats[quote_key] = entry
 
@@ -295,7 +295,10 @@ async def handle_quote_feedback(callback: CallbackQuery):
         if user_id is not None:
             voters[str(user_id)] = "dislike"
 
-    save_quote_stats()
+    try:
+        save_quote_stats()
+    except Exception as exc:
+        print(f"Ошибка сохранения оценок цитат: {exc}")
     if callback.message and entry.get("text"):
         await callback.message.edit_text(
             build_quote_display_text(str(entry.get("text", ""))),

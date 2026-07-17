@@ -143,42 +143,59 @@ async def handle_help(message: Message):
     )
 
 
+def _has_bot_mention(text: str) -> bool:
+    lowered = (text or "").strip().lower()
+    if not lowered:
+        return False
+    if BOT_USERNAME:
+        return f"@{BOT_USERNAME.lower()}" in lowered
+    return bool(re.search(r"@\w+", lowered))
+
+
 @dp.message(Command(commands=["q"], ignore_case=True))
 async def handle_quote_command(message: Message):
     increment_stat("commands_used")
     text = (message.text or "").strip()
-    args = text.split()[1:] if text.startswith("/q") else []
+    command_body = ""
+    if text.lower().startswith("/q"):
+        payload = text[2:].strip()
+        if payload.startswith("@"):
+            payload = payload.split(None, 1)[1] if " " in payload else ""
+        command_body = payload.strip()
+    command_tokens = command_body.split() if command_body else []
+    explicit_style = parse_quote_command_args(command_tokens)
 
     replied = message.reply_to_message
-    if not replied:
-        await message.reply("Ответь на сообщение, чтобы я сделал из него цитату.")
-        return
-
-    explicit_style = parse_quote_command_args(args)
-
     source_text = ""
-    if replied.voice or replied.audio:
-        file_id = getattr(replied.voice, "file_id", None) or getattr(replied.audio, "file_id", None)
-        if file_id:
-            audio_bytes = await download_file_bytes(file_id)
-            if audio_bytes:
-                audio_format = guess_audio_format(getattr(replied.voice, "mime_type", None) or getattr(replied.audio, "mime_type", None))
-                source_text = await transcribe_audio_bytes(audio_bytes, audio_format)
-    elif replied.photo:
-        photo = max(replied.photo, key=lambda item: (getattr(item, "width", 0) or 0) * (getattr(item, "height", 0) or 0))
-        if photo:
-            photo_bytes = await download_file_bytes(photo.file_id)
-            if photo_bytes:
-                source_text = await describe_photo_bytes(photo_bytes)
+
+    if command_body:
+        source_text = command_body
+    elif replied:
+        if replied.voice or replied.audio:
+            file_id = getattr(replied.voice, "file_id", None) or getattr(replied.audio, "file_id", None)
+            if file_id:
+                audio_bytes = await download_file_bytes(file_id)
+                if audio_bytes:
+                    audio_format = guess_audio_format(getattr(replied.voice, "mime_type", None) or getattr(replied.audio, "mime_type", None))
+                    source_text = await transcribe_audio_bytes(audio_bytes, audio_format)
+        elif replied.photo:
+            photo = max(replied.photo, key=lambda item: (getattr(item, "width", 0) or 0) * (getattr(item, "height", 0) or 0))
+            if photo:
+                photo_bytes = await download_file_bytes(photo.file_id)
+                if photo_bytes:
+                    source_text = await describe_photo_bytes(photo_bytes)
+        else:
+            source_texts = await collect_reply_context(replied, max_messages=4)
+            if not source_texts:
+                await message.reply("Не нашёл ни одного текстового сообщения для цитаты.")
+                return
+            relevant_messages = select_relevant_messages(source_texts, max_items=1)
+            if not relevant_messages:
+                relevant_messages = source_texts[:1]
+            source_text = "\n".join(relevant_messages)
     else:
-        source_texts = await collect_reply_context(replied, max_messages=4)
-        if not source_texts:
-            await message.reply("Не нашёл ни одного текстового сообщения для цитаты.")
-            return
-        relevant_messages = select_relevant_messages(source_texts, max_items=1)
-        if not relevant_messages:
-            relevant_messages = source_texts[:1]
-        source_text = "\n".join(relevant_messages)
+        await message.reply("Ответь на сообщение или напиши текст после /q, чтобы я сделал из него цитату.")
+        return
 
     if not source_text.strip():
         await message.reply("Не нашёл подходящего текста для цитаты.")
@@ -191,16 +208,28 @@ async def handle_quote_command(message: Message):
         print(f"Ошибка отправки typing action: {exc}")
 
     reply_text = await generate_quote_reply(source_text, resolved_style, text, chat_id=message.chat.id)
-    await send_quote_with_feedback(
-        message.chat.id,
-        message.message_id,
-        reply_text,
-        source_chat_id=replied.chat.id,
-        source_message_id=replied.message_id,
-        source_user_id=getattr(replied.from_user, "id", None),
-        source_username=getattr(replied.from_user, "username", None) or getattr(replied.from_user, "first_name", None),
-        source_chat_username=getattr(replied.chat, "username", None),
-    )
+    if replied is not None:
+        await send_quote_with_feedback(
+            message.chat.id,
+            message.message_id,
+            reply_text,
+            source_chat_id=replied.chat.id,
+            source_message_id=replied.message_id,
+            source_user_id=getattr(replied.from_user, "id", None),
+            source_username=getattr(replied.from_user, "username", None) or getattr(replied.from_user, "first_name", None),
+            source_chat_username=getattr(replied.chat, "username", None),
+        )
+    else:
+        await send_quote_with_feedback(
+            message.chat.id,
+            message.message_id,
+            reply_text,
+            source_chat_id=message.chat.id,
+            source_message_id=message.message_id,
+            source_user_id=getattr(getattr(message, "from_user", None), "id", None),
+            source_username=getattr(getattr(message, "from_user", None), "username", None) or getattr(getattr(message, "from_user", None), "first_name", None),
+            source_chat_username=getattr(message.chat, "username", None),
+        )
 
 
 @dp.message(Command(commands=["topquotes", "top"], ignore_case=True))
@@ -273,8 +302,8 @@ def _build_mortis_chat_reply(text: str) -> str:
 
     if any(keyword in normalized for keyword in ["3.14", "314", "рас", "3 14", "3,14", "314рас", "3.14рас", "3,14рас"]):
         if any(keyword in normalized for keyword in ["реально", "серьёзно", "серьезно", "на самом деле", "по делу", "задева", "обид", "оскорб"]):
-            return "Если это не шутка, а реально попытка задеть человека, то я это вижу как серьёзный негатив и отвечу спокойно, но жёстко по фактам."
-        return "Если это просто шутка про 3.14рас, то я понимаю и не буду делать из этого трагедию. Но если ты переходишь на реальные выпады, я уже не буду это пропускать."
+            return "Если это не шутка, а реально попытка задеть человека, то в тебе вижу только одно, пустое место."
+        return "Если это просто шутка про 3.14рас, то я понимаю тебя)"
 
     return "Если ты говоришь про Мортиса, то я отвечу спокойно, по фактам и без лишнего хамства."
 
@@ -336,7 +365,7 @@ async def handle_general_templates(message: Message):
     if not text and not has_media:
         return
 
-    if message.text and message.text.startswith("/"):
+    if message.text and message.text.startswith("/") and not message.text.lower().startswith("/q"):
         return
     if message.from_user and message.from_user.is_bot:
         return
@@ -426,6 +455,10 @@ async def handle_general_templates(message: Message):
             await message.reply("Комментарий отправлен пользователю.")
         return
 
+    if text.lower().strip() == "прохладно 🤣":
+        await message.reply("ладно")
+        return
+
     if is_meme_template_text(text):
         template = get_private_chat_template(text)
         if template:
@@ -439,12 +472,14 @@ async def handle_general_templates(message: Message):
             return
 
     if is_mortis_related_text(text):
-        await message.reply(_build_mortis_chat_reply(text))
-        return
+        if is_private_chat(message) or _has_bot_mention(text):
+            await message.reply(_build_mortis_chat_reply(text))
+            return
 
     if is_kira_related_text(text):
-        await message.reply(_build_kira_reply(text))
-        return
+        if is_private_chat(message) or _has_bot_mention(text):
+            await message.reply(_build_kira_reply(text))
+            return
 
     if is_private_chat(message):
         template = get_private_chat_template(text)

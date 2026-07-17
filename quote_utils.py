@@ -447,6 +447,10 @@ async def send_quote_with_feedback(
         source_username=source_username,
         source_chat_username=source_chat_username,
     )
+    try:
+        save_quote_stats()
+    except Exception as exc:
+        print(f"Ошибка сохранения цитаты в storage: {exc}")
     display_text = build_quote_display_text(reply_text)
     markup = build_feedback_markup(reply_text)
     try:

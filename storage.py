@@ -50,27 +50,33 @@ def load_quote_stats() -> dict[str, dict[str, Any]]:
     global quote_stats
     init_storage_db()
 
+    loaded: dict[str, dict[str, Any]] = {}
+
     try:
         with sqlite3.connect(DB_PATH) as connection:
             rows = connection.execute("SELECT key, payload FROM quote_stats").fetchall()
             if rows:
-                quote_stats = {key: json.loads(payload) for key, payload in rows if isinstance(payload, str)}
-                return quote_stats
+                loaded = {key: json.loads(payload) for key, payload in rows if isinstance(payload, str)}
     except Exception:
-        quote_stats = {}
+        loaded = {}
 
-    if STATS_PATH.exists():
+    if not loaded and STATS_PATH.exists():
         try:
             with STATS_PATH.open("r", encoding="utf-8") as handle:
                 data = json.load(handle)
             if isinstance(data, dict):
-                quote_stats = data
-                save_quote_stats()
-                return quote_stats
+                loaded = data
         except Exception:
-            quote_stats = {}
-    else:
-        quote_stats = {}
+            loaded = {}
+
+    if not loaded:
+        loaded = {}
+
+    quote_stats = loaded
+    try:
+        save_quote_stats()
+    except Exception:
+        pass
     return quote_stats
 
 
@@ -79,11 +85,19 @@ def save_quote_stats() -> None:
     with sqlite3.connect(DB_PATH) as connection:
         connection.execute("DELETE FROM quote_stats")
         for key, entry in quote_stats.items():
+            if not isinstance(entry, dict):
+                continue
             connection.execute(
                 "INSERT INTO quote_stats (key, payload) VALUES (?, ?)",
                 (key, json.dumps(entry, ensure_ascii=False)),
             )
         connection.commit()
+
+    try:
+        with STATS_PATH.open("w", encoding="utf-8") as handle:
+            json.dump(quote_stats, handle, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 
 def load_chat_settings() -> dict[str, dict[str, Any]]:
