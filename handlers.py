@@ -44,6 +44,7 @@ from helpers import (
     is_admin_user,
     is_kira_related_text,
     is_meme_template_text,
+    is_mortis_intro_question,
     is_mortis_related_text,
     is_private_chat,
     is_video_update_request,
@@ -268,7 +269,7 @@ def _build_mortis_chat_reply(text: str) -> str:
         return "Уже придумал. Вот он: Мортис — настоящий рыцарь и одновременно сигма, который копит ауру и потом доказывает всем, что он всегда прав. На том и держится настоящая машина для мозга 🤙"
 
     if any(keyword in normalized for keyword in ["серьёзно", "серьезно", "по фактам", "реально", "спокойно"]):
-        return "Если по фактам, то я защищаю разработчика спокойно и аргументированно, а не просто разгоняю эмоции."
+        return "Если по фактам, то я защищаю разработчика спокойно и аргументированно, а не просто разгоняю эмоции. Это серьёзно."
 
     if any(keyword in normalized for keyword in ["3.14", "314", "рас", "3 14", "3,14", "314рас", "3.14рас", "3,14рас"]):
         if any(keyword in normalized for keyword in ["реально", "серьёзно", "серьезно", "на самом деле", "по делу", "задева", "обид", "оскорб"]):
@@ -426,6 +427,12 @@ async def handle_general_templates(message: Message):
         return
 
     if is_meme_template_text(text):
+        template = get_private_chat_template(text)
+        if template:
+            await message.reply(template)
+            return
+
+    if is_mortis_intro_question(text):
         template = get_private_chat_template(text)
         if template:
             await message.reply(template)
