@@ -106,6 +106,56 @@ class QuoteStyleTests(unittest.TestCase):
         self.assertIn("Mortisplay", reply_text)
         self.assertNotIn("Если ты говоришь про Мортиса", reply_text)
 
+    def test_handle_quote_command_uses_current_command_text(self):
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=1),
+            text="/q@agentplay_bot вот текст для цитаты",
+            reply_to_message=None,
+            message_id=7,
+            reply=AsyncMock(),
+        )
+        collect_context_mock = Mock()
+        generate_quote_reply_mock = AsyncMock(return_value="цитата")
+
+        async def run_test():
+            with (
+                patch("handlers.increment_stat", Mock()),
+                patch("handlers.bot.send_chat_action", new=AsyncMock()),
+                patch("handlers.generate_quote_reply", generate_quote_reply_mock),
+                patch("handlers.send_quote_with_feedback", new=AsyncMock()),
+                patch("handlers.collect_reply_context", new=AsyncMock(return_value=["ignored"])) as collect_context_mock,
+            ):
+                await handlers.handle_quote_command(message)
+
+        asyncio.run(run_test())
+
+        self.assertFalse(collect_context_mock.called)
+        self.assertEqual(generate_quote_reply_mock.await_args.args[0], "вот текст для цитаты")
+
+    def test_handler_replies_with_ladno_to_cool_message(self):
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=1, type="private"),
+            from_user=SimpleNamespace(id=2, is_bot=False),
+            text="прохладно 🤣",
+            caption=None,
+            photo=None,
+            video=None,
+            video_note=None,
+            voice=None,
+            audio=None,
+            document=None,
+            reply_to_message=None,
+            reply=AsyncMock(),
+        )
+
+        async def run_test():
+            with patch("handlers.random.random", return_value=0.0), patch("handlers.save_message_to_history", Mock()):
+                await handlers.handle_general_templates(message)
+
+        asyncio.run(run_test())
+
+        self.assertEqual(message.reply.await_args_list[0].args[0], "ладно")
+
     def test_reply_to_agent_message_accepts_explicit_arguments(self):
         message = SimpleNamespace(chat=SimpleNamespace(id=1), reply=AsyncMock())
         status = SimpleNamespace(edit_text=AsyncMock())
