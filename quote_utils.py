@@ -438,8 +438,8 @@ async def send_quote_with_feedback(
     source_user_id: int | None = None,
     source_username: str | None = None,
     source_chat_username: str | None = None,
-) -> None:
-    ensure_quote_stats_entry(
+) -> int | None:
+    entry = ensure_quote_stats_entry(
         reply_text,
         source_chat_id=source_chat_id,
         source_message_id=source_message_id,
@@ -455,9 +455,20 @@ async def send_quote_with_feedback(
     markup = build_feedback_markup(reply_text)
     try:
         if reply_to_message_id:
-            await bot.send_message(chat_id=chat_id, text=display_text, reply_to_message_id=reply_to_message_id, reply_markup=markup)
+            sent = await bot.send_message(chat_id=chat_id, text=display_text, reply_to_message_id=reply_to_message_id, reply_markup=markup)
         else:
-            await bot.send_message(chat_id=chat_id, text=display_text, reply_markup=markup)
+            sent = await bot.send_message(chat_id=chat_id, text=display_text, reply_markup=markup)
+        # Сохраняем ID сообщения с цитатой для ссылки в /top
+        quote_key = get_quote_key(reply_text)
+        if quote_key in quote_stats:
+            quote_stats[quote_key]["quote_chat_id"] = chat_id
+            quote_stats[quote_key]["quote_message_id"] = sent.message_id
+            try:
+                save_quote_stats()
+            except Exception as exc:
+                print(f"Ошибка сохранения quote_message_id: {exc}")
+        return sent.message_id
     except Exception as exc:
         print(f"Ошибка отправки AI-цитаты: {exc}")
         traceback.print_exc()
+        return None

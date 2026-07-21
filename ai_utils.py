@@ -6,8 +6,24 @@ import traceback
 
 import httpx
 from aiogram.types import Message
+from PIL import Image
 
 from bot_config import ai_client, bot, MODEL_CHAT, MODEL_VISION, MODEL_WHISPER, OPENAI_API_KEY, increment_stat
+
+
+def _convert_bytes_to_png(image_bytes: bytes) -> bytes | None:
+    """Конвертирует изображение в PNG (поддерживается всеми AI-провайдерами)."""
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        # Конвертируем в RGB если есть альфа-канал (RGBA, P mode)
+        if img.mode in ("RGBA", "P", "LA"):
+            img = img.convert("RGB")
+        output = io.BytesIO()
+        img.save(output, format="PNG")
+        return output.getvalue()
+    except Exception as exc:
+        print(f"Ошибка конвертации изображения в PNG: {exc}")
+        return None
 
 
 async def describe_photo_bytes(image_bytes: bytes) -> str:
@@ -15,7 +31,12 @@ async def describe_photo_bytes(image_bytes: bytes) -> str:
         return ""
 
     try:
-        encoded = base64.b64encode(image_bytes).decode("ascii")
+        # Конвертируем в PNG, чтобы избежать ошибок формата
+        png_bytes = _convert_bytes_to_png(image_bytes)
+        if not png_bytes:
+            return ""
+
+        encoded = base64.b64encode(png_bytes).decode("ascii")
         response = await ai_client.chat.completions.create(
             model=MODEL_VISION,
             messages=[
@@ -28,13 +49,13 @@ async def describe_photo_bytes(image_bytes: bytes) -> str:
                         },
                         {
                             "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
+                            "image_url": {"url": f"data:image/png;base64,{encoded}"},
                         },
                     ],
                 }
             ],
-            max_tokens=40,
-            temperature=0.2,
+            max_tokens=60,
+            temperature=0.3,
         )
         choices = getattr(response, "choices", None) or []
         if not choices:

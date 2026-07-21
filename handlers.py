@@ -52,14 +52,12 @@ from helpers import (
 from interactions import send_bug_report_to_admin, send_question_to_admin, send_suggestion_to_admin
 from markup import build_admin_markup, build_welcome_markup
 from quote_utils import (
-    collect_reply_context,
     format_quote_source,
     get_quote_style,
     generate_quote_reply,
     infer_quote_style,
     is_ai_quote_message,
     parse_quote_command_args,
-    select_relevant_messages,
     send_quote_with_feedback,
 )
 from storage import load_chat_settings, load_quote_stats, save_message_to_history
@@ -171,6 +169,7 @@ async def handle_quote_command(message: Message):
     if command_body:
         source_text = command_body
     elif replied:
+        # --- ГОЛОСОВЫЕ / АУДИО: транскрибация ---
         if replied.voice or replied.audio:
             file_id = getattr(replied.voice, "file_id", None) or getattr(replied.audio, "file_id", None)
             if file_id:
@@ -178,21 +177,51 @@ async def handle_quote_command(message: Message):
                 if audio_bytes:
                     audio_format = guess_audio_format(getattr(replied.voice, "mime_type", None) or getattr(replied.audio, "mime_type", None))
                     source_text = await transcribe_audio_bytes(audio_bytes, audio_format)
+            if not source_text.strip():
+                await message.reply("Не удалось распознать голосовое сообщение. Попробуй ещё раз или отправь текст.")
+                return
+        # --- ФОТО: описание через AI vision + caption (если есть) ---
         elif replied.photo:
             photo = max(replied.photo, key=lambda item: (getattr(item, "width", 0) or 0) * (getattr(item, "height", 0) or 0))
+            caption = (replied.caption or "").strip()
             if photo:
                 photo_bytes = await download_file_bytes(photo.file_id)
                 if photo_bytes:
-                    source_text = await describe_photo_bytes(photo_bytes)
-        else:
-            source_texts = await collect_reply_context(replied, max_messages=4)
-            if not source_texts:
-                await message.reply("Не нашёл ни одного текстового сообщения для цитаты.")
+                    description = await describe_photo_bytes(photo_bytes)
+                    if caption and description:
+                        source_text = f"{caption}\n\n{description}"
+                    elif description:
+                        source_text = description
+                    elif caption:
+                        source_text = caption
+            if not source_text.strip():
+                await message.reply("Не удалось описать фото. Попробуй ещё раз или отправь текст.")
                 return
-            relevant_messages = select_relevant_messages(source_texts, max_items=1)
-            if not relevant_messages:
-                relevant_messages = source_texts[:1]
-            source_text = "\n".join(relevant_messages)
+        # --- ВИДЕО: caption + описание через AI vision (thumbnail) ---
+        elif replied.video or replied.video_note:
+            caption = (replied.caption or "").strip()
+            # Пробуем получить thumbnail видео (первый кадр) для описания
+            video_description = ""
+            thumbnail = getattr(replied.video, "thumbnail", None) if replied.video else None
+            if thumbnail:
+                thumb_bytes = await download_file_bytes(thumbnail.file_id)
+                if thumb_bytes:
+                    video_description = await describe_photo_bytes(thumb_bytes)
+            if caption and video_description:
+                source_text = f"{caption}\n\n{video_description}"
+            elif video_description:
+                source_text = video_description
+            elif caption:
+                source_text = caption
+            if not source_text.strip():
+                await message.reply("Не удалось описать видео. Попробуй ещё раз или отправь текст.")
+                return
+        # --- ТЕКСТ / ВСЁ ОСТАЛЬНОЕ ---
+        else:
+            source_text = await extract_text_source(replied)
+            if not source_text.strip():
+                await message.reply("Не нашёл текста в этом сообщении для цитаты.")
+                return
     else:
         await message.reply("Ответь на сообщение или напиши текст после /q, чтобы я сделал из него цитату.")
         return
@@ -200,6 +229,13 @@ async def handle_quote_command(message: Message):
     if not source_text.strip():
         await message.reply("Не нашёл подходящего текста для цитаты.")
         return
+
+    # Если ответили на AI-цитату — используем AI-генерацию с учётом контекста
+    if replied and is_ai_quote_message(replied):
+        # Берём текст AI-цитаты как контекст для новой генерации
+        ai_quote_text = await extract_text_source(replied)
+        if ai_quote_text.strip():
+            source_text = f"В ответ на: {ai_quote_text}\n\n{source_text}"
 
     resolved_style = get_quote_style(explicit_style) if explicit_style else infer_quote_style(source_text, text)
     try:
@@ -211,7 +247,7 @@ async def handle_quote_command(message: Message):
     if replied is not None:
         await send_quote_with_feedback(
             message.chat.id,
-            message.message_id,
+            replied.message_id,
             reply_text,
             source_chat_id=replied.chat.id,
             source_message_id=replied.message_id,
@@ -239,10 +275,16 @@ async def handle_top_quotes(message: Message):
         await message.reply("Команда /top доступна только в группах.")
         return
     
+    chat_id = message.chat.id
+    
     rated_quotes = [
         item
         for item in quote_stats.values()
-        if int(item.get("likes", 0)) > 0 or int(item.get("dislikes", 0)) > 0
+        if (
+            int(item.get("likes", 0)) > 0 or int(item.get("dislikes", 0)) > 0
+        ) and (
+            item.get("quote_chat_id") == chat_id or item.get("source_chat_id") == chat_id
+        )
     ]
     ranked = sorted(
         rated_quotes,
@@ -254,7 +296,7 @@ async def handle_top_quotes(message: Message):
     )[:5]
 
     if not ranked:
-        await message.reply("Пока никто не оценивал цитаты. Лайкай и собирай топ!")
+        await message.reply("Пока никто не оценивал цитаты в этом чате. Лайкай и собирай топ!")
         return
 
     lines = []
@@ -262,12 +304,28 @@ async def handle_top_quotes(message: Message):
         text = html.escape(str(item.get("text", "—")))
         likes = int(item.get("likes", 0))
         dislikes = int(item.get("dislikes", 0))
+        
+        # Ссылка на сообщение с цитатой
+        quote_chat_id = item.get("quote_chat_id")
+        quote_message_id = item.get("quote_message_id")
+        if quote_chat_id and quote_message_id:
+            try:
+                clean_id = str(abs(int(quote_chat_id)))
+                if clean_id.startswith("100"):
+                    clean_id = clean_id[3:]
+                quote_url = f"https://t.me/c/{clean_id}/{int(quote_message_id)}"
+                link = f'<a href="{html.escape(quote_url, quote=True)}">🔗</a>'
+            except (TypeError, ValueError):
+                link = ""
+        else:
+            link = ""
+        
         source = format_quote_source(item, bot_config.BOT_USERNAME)
         lines.append(
-            f"{idx + 1}. <b>{text}</b> — 👍 {likes} 👎 {dislikes}\nИсточник: {source}"
+            f"{idx + 1}. {link} <b>{text}</b> — 👍 {likes} 👎 {dislikes}\nИсточник: {source}"
         )
 
-    await message.reply("Топ 5 оценённых цитат:\n" + "\n\n".join(lines), parse_mode="HTML")
+    await message.reply("🏆 Топ 5 оценённых цитат в этом чате:\n" + "\n\n".join(lines), parse_mode="HTML")
 
 
 def _build_mortis_chat_reply(text: str) -> str:

@@ -1,10 +1,12 @@
 import json
+from pathlib import Path
 import re
 import sqlite3
 import time
 from typing import Any
 
-from bot_config import DB_PATH, CHAT_SETTINGS_PATH, STATS_PATH, chat_settings, quote_stats
+import bot_config
+from bot_config import DB_PATH, CHAT_SETTINGS_PATH, STATS_PATH, chat_settings
 
 
 def init_storage_db() -> None:
@@ -47,11 +49,11 @@ def get_recent_chat_context(chat_id: int, limit: int = 15) -> str:
 
 
 def load_quote_stats() -> dict[str, dict[str, Any]]:
-    global quote_stats
     init_storage_db()
 
     loaded: dict[str, dict[str, Any]] = {}
 
+    # 1. Загружаем из SQLite
     try:
         with sqlite3.connect(DB_PATH) as connection:
             rows = connection.execute("SELECT key, payload FROM quote_stats").fetchall()
@@ -60,6 +62,7 @@ def load_quote_stats() -> dict[str, dict[str, Any]]:
     except Exception:
         loaded = {}
 
+    # 2. Если в SQLite пусто — пробуем загрузить из data/quote_stats.json
     if not loaded and STATS_PATH.exists():
         try:
             with STATS_PATH.open("r", encoding="utf-8") as handle:
@@ -69,22 +72,38 @@ def load_quote_stats() -> dict[str, dict[str, Any]]:
         except Exception:
             loaded = {}
 
+    # 3. Если всё ещё пусто — пробуем загрузить из корневого quote_stats.json (старый файл)
+    if not loaded:
+        legacy_path = Path(__file__).resolve().parent / "quote_stats.json"
+        if legacy_path.exists():
+            try:
+                with legacy_path.open("r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+                if isinstance(data, dict):
+                    loaded = data
+                    print(f"Импортировано {len(loaded)} цитат из корневого quote_stats.json")
+            except Exception:
+                loaded = {}
+
     if not loaded:
         loaded = {}
 
-    quote_stats = loaded
+    # Обновляем bot_config.quote_stats напрямую (не переприсваивая)
+    bot_config.quote_stats.clear()
+    bot_config.quote_stats.update(loaded)
     try:
         save_quote_stats()
     except Exception:
         pass
-    return quote_stats
+    return bot_config.quote_stats
 
 
 def save_quote_stats() -> None:
     init_storage_db()
+    data = bot_config.quote_stats
     with sqlite3.connect(DB_PATH) as connection:
         connection.execute("DELETE FROM quote_stats")
-        for key, entry in quote_stats.items():
+        for key, entry in data.items():
             if not isinstance(entry, dict):
                 continue
             connection.execute(
@@ -95,44 +114,49 @@ def save_quote_stats() -> None:
 
     try:
         with STATS_PATH.open("w", encoding="utf-8") as handle:
-            json.dump(quote_stats, handle, ensure_ascii=False, indent=2)
+            json.dump(data, handle, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
 
 def load_chat_settings() -> dict[str, dict[str, Any]]:
-    global chat_settings
     init_storage_db()
+
+    loaded: dict[str, dict[str, Any]] = {}
 
     try:
         with sqlite3.connect(DB_PATH) as connection:
             rows = connection.execute("SELECT chat_id, payload FROM chat_settings").fetchall()
             if rows:
-                chat_settings = {chat_id: json.loads(payload) for chat_id, payload in rows if isinstance(payload, str)}
-                return chat_settings
+                loaded = {chat_id: json.loads(payload) for chat_id, payload in rows if isinstance(payload, str)}
     except Exception:
-        chat_settings = {}
+        loaded = {}
 
-    if CHAT_SETTINGS_PATH.exists():
+    if not loaded and CHAT_SETTINGS_PATH.exists():
         try:
             with CHAT_SETTINGS_PATH.open("r", encoding="utf-8") as handle:
                 data = json.load(handle)
             if isinstance(data, dict):
-                chat_settings = data
-                save_chat_settings()
-                return chat_settings
+                loaded = data
         except Exception:
-            chat_settings = {}
-    else:
-        chat_settings = {}
-    return chat_settings
+            loaded = {}
+
+    # Обновляем bot_config.chat_settings напрямую
+    bot_config.chat_settings.clear()
+    bot_config.chat_settings.update(loaded)
+    try:
+        save_chat_settings()
+    except Exception:
+        pass
+    return bot_config.chat_settings
 
 
 def save_chat_settings() -> None:
     init_storage_db()
+    data = bot_config.chat_settings
     with sqlite3.connect(DB_PATH) as connection:
         connection.execute("DELETE FROM chat_settings")
-        for chat_id, entry in chat_settings.items():
+        for chat_id, entry in data.items():
             connection.execute(
                 "INSERT INTO chat_settings (chat_id, payload) VALUES (?, ?)",
                 (chat_id, json.dumps(entry, ensure_ascii=False)),
