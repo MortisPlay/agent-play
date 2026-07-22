@@ -113,7 +113,11 @@ async def animate_thinking_status(message: Message, status_msg, duration: float 
 async def handle_admin_reply(message: Message):
     """
     Обработчик команды /reply <user_id> <текст>
-    Отправляет ответ пользователю из чата поддержки на сайте напрямую через бота.
+    Отправляет ответ пользователю из чата поддержки на сайте.
+    
+    Если ID пользователя числовой — отправляет напрямую в Telegram.
+    Если ID строковый (user_xxx) — сохраняет ответ в JSON-файл в папку сайта,
+    откуда сайт сможет его прочитать через HTTP.
     """
     if not is_admin_user(message.from_user):
         await message.reply("Нет доступа.")
@@ -138,6 +142,7 @@ async def handle_admin_reply(message: Message):
         await message.reply("❌ Напиши текст ответа после ID пользователя.")
         return
 
+    # Пробуем отправить как числовой ID (Telegram user ID)
     try:
         await bot.send_message(
             chat_id=int(target_user_id),
@@ -146,17 +151,64 @@ async def handle_admin_reply(message: Message):
         )
         await message.reply(f"✅ Ответ отправлен пользователю `{target_user_id}`.", parse_mode="Markdown")
         print(f"[CHAT REPLY] Ответ отправлен пользователю {target_user_id}: {reply_text[:50]}...")
+        return
+    except ValueError:
+        # ID нечисловой — это строковый ID сайта (user_xxx)
+        pass
     except Exception as e:
-        # Если не удалось отправить по числовому ID, возможно это строковый ID (user_xxx)
-        # В таком случае просто уведомляем админа, что ответ нужно отправить через сайт
+        print(f"[CHAT REPLY] Ошибка отправки пользователю {target_user_id}: {e}")
+
+    # Если ID строковый (user_xxx) — сохраняем ответ в JSON-файл в корень сайта
+    try:
+        import json
+        from pathlib import Path
+        
+        # Путь к корню сайта (относительно папки бота: поднимаемся на уровень выше)
+        site_dir = Path(__file__).resolve().parent.parent
+        replies_file = site_dir / "chat_replies.json"
+        
+        replies = {}
+        
+        # Загружаем существующие ответы
+        if replies_file.exists():
+            try:
+                with open(replies_file, "r", encoding="utf-8") as f:
+                    replies = json.load(f)
+            except (json.JSONDecodeError, Exception):
+                replies = {}
+        
+        # Добавляем новый ответ
+        if target_user_id not in replies:
+            replies[target_user_id] = []
+        
+        replies[target_user_id].append({
+            "text": reply_text,
+            "time": time.time(),
+            "delivered": False
+        })
+        
+        # Оставляем только последние 10 ответов на пользователя
+        if len(replies[target_user_id]) > 10:
+            replies[target_user_id] = replies[target_user_id][-10:]
+        
+        with open(replies_file, "w", encoding="utf-8") as f:
+            json.dump(replies, f, ensure_ascii=False, indent=2)
+        
         await message.reply(
-            f"⚠️ Не удалось отправить ответ напрямую (ID: `{target_user_id}`).\n\n"
-            f"Этот ID используется сайтом для идентификации. Ответ будет доставлен, "
-            f"когда пользователь откроет сайт.\n\n"
-            f"Текст ответа:\n{reply_text}",
+            f"✅ Ответ сохранён для пользователя `{target_user_id}`.\n"
+            f"Он увидит его при следующей проверке на сайте.\n\n"
+            f"📝 *Текст:* {reply_text}",
             parse_mode="Markdown"
         )
-        print(f"[CHAT REPLY] Ошибка отправки пользователю {target_user_id}: {e}")
+        print(f"[CHAT REPLY] Ответ сохранён в {replies_file} для {target_user_id}: {reply_text[:50]}...")
+    except Exception as e:
+        await message.reply(
+            f"⚠️ Ошибка сохранения ответа: {e}\n\n"
+            f"ID: `{target_user_id}`\n"
+            f"Текст: {reply_text}",
+            parse_mode="Markdown"
+        )
+        print(f"[CHAT REPLY] Ошибка сохранения ответа в файл: {e}")
 
 
 @dp.message(Command(commands=["admin"], ignore_case=True))
