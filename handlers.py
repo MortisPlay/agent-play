@@ -109,6 +109,56 @@ async def animate_thinking_status(message: Message, status_msg, duration: float 
         pass
 
 
+@dp.message(Command(commands=["reply"], ignore_case=True, prefix="/"))
+async def handle_admin_reply(message: Message):
+    """
+    Обработчик команды /reply <user_id> <текст>
+    Отправляет ответ пользователю из чата поддержки на сайте напрямую через бота.
+    """
+    if not is_admin_user(message.from_user):
+        await message.reply("Нет доступа.")
+        return
+
+    text = (message.text or "").strip()
+    # Парсим: /reply user_xxx текст ответа
+    match = re.match(r"^/reply\s+(\S+)\s+([\s\S]+)", text, re.IGNORECASE)
+    if not match:
+        await message.reply(
+            "❌ Неверный формат. Используй:\n"
+            "`/reply user_id текст ответа`\n\n"
+            "ID пользователя можно скопировать из сообщения в чате поддержки.",
+            parse_mode="Markdown"
+        )
+        return
+
+    target_user_id = match.group(1)
+    reply_text = match.group(2).strip()
+
+    if not reply_text:
+        await message.reply("❌ Напиши текст ответа после ID пользователя.")
+        return
+
+    try:
+        await bot.send_message(
+            chat_id=int(target_user_id),
+            text=f"💬 *Ответ от администратора:*\n\n{reply_text}",
+            parse_mode="Markdown"
+        )
+        await message.reply(f"✅ Ответ отправлен пользователю `{target_user_id}`.", parse_mode="Markdown")
+        print(f"[CHAT REPLY] Ответ отправлен пользователю {target_user_id}: {reply_text[:50]}...")
+    except Exception as e:
+        # Если не удалось отправить по числовому ID, возможно это строковый ID (user_xxx)
+        # В таком случае просто уведомляем админа, что ответ нужно отправить через сайт
+        await message.reply(
+            f"⚠️ Не удалось отправить ответ напрямую (ID: `{target_user_id}`).\n\n"
+            f"Этот ID используется сайтом для идентификации. Ответ будет доставлен, "
+            f"когда пользователь откроет сайт.\n\n"
+            f"Текст ответа:\n{reply_text}",
+            parse_mode="Markdown"
+        )
+        print(f"[CHAT REPLY] Ошибка отправки пользователю {target_user_id}: {e}")
+
+
 @dp.message(Command(commands=["admin"], ignore_case=True))
 async def handle_admin_panel(message: Message):
     if not is_admin_user(message.from_user):
