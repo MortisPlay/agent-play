@@ -370,6 +370,21 @@ def build_quote_display_text(text: str) -> str:
     return text.strip()
 
 
+def _clean_quote_text(text: str) -> str:
+    """Очищает текст цитаты от обрывков слов и артефактов."""
+    if not text:
+        return text
+    # Удаляем обрывки слов, где латиница перемешана с кириллицей
+    text = re.sub(r'\b[a-zA-Z]+[а-яА-ЯёЁ][a-zA-Zа-яА-ЯёЁ]*\b', '', text)
+    # Удаляем одиночные латинские буквы
+    text = re.sub(r'\s+[a-zA-Z]\s+', ' ', text)
+    # Удаляем множественные пробелы
+    text = re.sub(r'\s{2,}', ' ', text)
+    # Удаляем пробелы перед знаками препинания
+    text = re.sub(r'\s+([,.;:!?…])', r'\1', text)
+    return text.strip()
+
+
 async def generate_quote_reply(text: str, style: str | None = None, command_text: str = "", chat_id: int | None = None) -> str:
     text = text.strip()
     if not text:
@@ -403,7 +418,7 @@ async def generate_quote_reply(text: str, style: str | None = None, command_text
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=90,
+            max_tokens=200,
             temperature=0.9,
             top_p=0.94,
             presence_penalty=0.2,
@@ -415,6 +430,7 @@ async def generate_quote_reply(text: str, style: str | None = None, command_text
         content = getattr(getattr(choice, "message", {}), "content", None)
         reply_text = content.strip() if content else ""
         if reply_text:
+            reply_text = _clean_quote_text(reply_text)
             cleaned = sanitize_quote_text(reply_text)
             if len(cleaned) > 2:
                 increment_stat("quote_created")

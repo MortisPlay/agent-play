@@ -194,6 +194,27 @@ def build_agent_persona_prompt(prompt_text: str, context_text: str | None = None
     return base_prompt
 
 
+def _clean_ai_response(text: str) -> str:
+    """Очищает ответ ИИ от обрывков слов, артефактов и мусора."""
+    if not text:
+        return text
+
+    # Удаляем обрывки слов, где латиница перемешана с кириллицей (например, "Uživательский")
+    text = re.sub(r'\b[a-zA-Z]+[а-яА-ЯёЁ][a-zA-Zа-яА-ЯёЁ]*\b', '', text)
+    # Удаляем одиночные латинские буквы, оставшиеся после чистки
+    text = re.sub(r'\s+[a-zA-Z]\s+', ' ', text)
+    # Удаляем множественные пробелы
+    text = re.sub(r'\s{2,}', ' ', text)
+    # Удаляем пробелы перед знаками препинания
+    text = re.sub(r'\s+([,.;:!?…])', r'\1', text)
+    # Если текст начинается с мусора (цифры, спецсимволы) — отрезаем
+    text = re.sub(r'^[\d\s*•\-]+', '', text).strip()
+    # Удаляем пустые строки в начале/конце
+    text = text.strip()
+
+    return text
+
+
 async def generate_ai_reply(prompt_text: str, context_text: str | None = None) -> str:
     system_prompt = build_agent_persona_prompt(prompt_text, context_text)
     messages = [
@@ -205,7 +226,7 @@ async def generate_ai_reply(prompt_text: str, context_text: str | None = None) -
         response = await ai_client.chat.completions.create(
             model=MODEL_CHAT,
             messages=messages,
-            max_tokens=180,
+            max_tokens=600,
             temperature=0.7,
             top_p=0.95,
             presence_penalty=0.2,
@@ -217,7 +238,8 @@ async def generate_ai_reply(prompt_text: str, context_text: str | None = None) -
         content = getattr(getattr(choice, "message", {}), "content", None)
         if content:
             increment_stat("ai_responses")
-            return content.strip()
+            cleaned = _clean_ai_response(content.strip())
+            return cleaned if cleaned else prompt_text.strip()
         return prompt_text.strip()
     except Exception as e:
         if is_openrouter_access_denied_error(e):
