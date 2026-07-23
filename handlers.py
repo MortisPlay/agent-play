@@ -1,12 +1,12 @@
+from builtins import *  # Явный импорт встроенных функций (для Pylance)
+
 import asyncio
 import hashlib
 import html
-import json
 import random
 import re
 import time
 import traceback
-from pathlib import Path
 
 from aiogram.filters import Command
 from aiogram.types import Message
@@ -80,7 +80,7 @@ THINKING_STATUSES = [
 ]
 
 
-async def animate_thinking_status(message: Message, status_msg, duration: float = 30.0):
+async def animate_thinking_status(status_msg, duration: float = 30.0):
     """
     Анимирует статусное сообщение с разными текстами пока проходит обработка.
     duration — максимальное время обновления (сек)
@@ -89,10 +89,10 @@ async def animate_thinking_status(message: Message, status_msg, duration: float 
         return
     
     try:
-        start_time = asyncio.get_event_loop().time()
+        start_time = time.monotonic()
         index = 0
         last_text = ""
-        while asyncio.get_event_loop().time() - start_time < duration:
+        while time.monotonic() - start_time < duration:
             try:
                 text = THINKING_STATUSES[index % len(THINKING_STATUSES)]
                 # Только обновляем если текст действительно изменился
@@ -104,7 +104,8 @@ async def animate_thinking_status(message: Message, status_msg, duration: float 
                 raise
             except Exception as e:
                 # Игнорируем ошибки "message not modified"
-                if "not modified" not in str(e).lower():
+                err_str = str(e).lower()
+                if "not modified" not in err_str and "message can't be edited" not in err_str:
                     print(f"Ошибка обновления статуса: {e}")
             await asyncio.sleep(0.8)
     except asyncio.CancelledError:
@@ -117,76 +118,6 @@ async def handle_admin_panel(message: Message):
         await message.reply("Нет доступа.")
         return
     await message.reply("Админ-панель", reply_markup=build_admin_markup(message.chat.id))
-
-
-@dp.message(Command(commands=["reply"], ignore_case=True))
-async def handle_admin_reply(message: Message):
-    """Обработчик команды /reply для ответа пользователям чата на сайте."""
-    if not is_admin_user(message.from_user):
-        await message.reply("Нет доступа.")
-        return
-    
-    text = (message.text or "").strip()
-    # Парсим: /reply user_id текст_ответа
-    # или: /reply user_id
-    parts = text.split(maxsplit=2)
-    if len(parts) < 2:
-        await message.reply("Использование: /reply user_id текст ответа")
-        return
-    
-    user_id = parts[1]
-    reply_text = parts[2] if len(parts) > 2 else ""
-    
-    # Если ответили на сообщение, берём текст оттуда
-    if not reply_text and message.reply_to_message:
-        reply_text = message.reply_to_message.text or message.reply_to_message.caption or ""
-    
-    if not reply_text:
-        await message.reply("Укажи текст ответа или ответь на сообщение.")
-        return
-    
-    # Пробуем отправить как числовой Telegram ID
-    if user_id.lstrip('-').isdigit():
-        try:
-            await bot.send_message(
-                chat_id=int(user_id),
-                text=f"🛡️ Ответ от администратора:\n\n{reply_text}"
-            )
-            await message.reply(f"✅ Ответ отправлен пользователю {user_id}")
-            return
-        except Exception as e:
-            await message.reply(f"⚠️ Не удалось отправить ответ напрямую (ID: {user_id}): {e}")
-            # Продолжаем — сохраняем в JSON как запасной вариант
-    
-    # Сохраняем ответ в JSON-файл для сайта
-    try:
-        # Путь к корню сайта (на две папки выше от БОТ/)
-        site_root = Path(__file__).resolve().parent.parent
-        json_path = site_root / "chat_replies.json"
-        
-        replies_data = {"replies": []}
-        if json_path.exists():
-            try:
-                with open(json_path, "r", encoding="utf-8") as f:
-                    replies_data = json.load(f)
-            except (json.JSONDecodeError, Exception):
-                replies_data = {"replies": []}
-        
-        # Добавляем новый ответ
-        new_reply = {
-            "id": f"reply_{int(time.time())}_{user_id}",
-            "user_id": user_id,
-            "text": reply_text,
-            "timestamp": int(time.time())
-        }
-        replies_data["replies"].append(new_reply)
-        
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(replies_data, f, ensure_ascii=False, indent=2)
-        
-        await message.reply(f"✅ Ответ сохранён для пользователя {user_id}")
-    except Exception as e:
-        await message.reply(f"❌ Ошибка сохранения ответа: {e}")
 
 
 @dp.message(Command(commands=["start"], ignore_case=True))
@@ -529,7 +460,7 @@ async def _reply_to_agent_message(message: Message, clean_text: str, context_tex
         print(f"Ошибка отправки typing action: {exc}")
 
     status = await message.reply("🤖 Думаю...")
-    animation_task = asyncio.create_task(animate_thinking_status(message, status, duration=35.0))
+    animation_task = asyncio.create_task(animate_thinking_status(status, duration=35.0))
 
     try:
         ai_resp = await generate_ai_reply(clean_text, context_text=context_text)
